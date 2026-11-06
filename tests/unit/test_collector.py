@@ -143,13 +143,25 @@ def test_collect_handles_empty_response() -> None:
     assert len(client.calls) == 1
 
 
-def test_collect_rejects_page_without_time_progress() -> None:
-    client = FakeClient([[make_raw_kline(1_000)], [make_raw_kline(1_000)]])
+def test_collect_rejects_candle_before_requested_start_time() -> None:
+    client = FakeClient([
+        [make_raw_kline(1_000)],
+        [make_raw_kline(1_000)],
+    ])
+
     repository = FakeRepository()
     collector = make_collector(client, repository)
 
-    with pytest.raises(ValueError, match="Kline pagination did not advance"):
-        collector.collect("BTCUSDT", "1h", start_time=1_000, end_time=3_000)
+    with pytest.raises(
+        ValueError,
+        match="Binance returned a candle before the requested start_time",
+    ):
+        collector.collect(
+            "BTCUSDT",
+            "1h",
+            start_time=1_000,
+            end_time=3_000,
+        )
 
     assert len(client.calls) == 2
 

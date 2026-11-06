@@ -12,6 +12,9 @@ dependencies = [
     "httpx>=0.28",
 ]
 
+[project.scripts]
+cryptolab = "cryptolab.cli:main"
+
 [project.optional-dependencies]
 test = [
     "pytest>=8.3",
