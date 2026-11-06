@@ -128,6 +128,56 @@ class SQLiteRepository:
             for row in rows
         ]
 
+    def get_candles_by_range(
+        self,
+        symbol: str,
+        interval: str,
+        start_time: int,
+        end_time: int,
+    ) -> list[Candle]:
+        """Return candles in the half-open interval [start_time, end_time)."""
+        with sqlite3.connect(self._database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    open_time,
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    close_time,
+                    quote_volume,
+                    number_of_trades,
+                    taker_buy_base_volume,
+                    taker_buy_quote_volume
+                FROM candles
+                WHERE symbol = ?
+                    AND interval = ?
+                    AND open_time >= ?
+                    AND open_time < ?
+                ORDER BY open_time ASC
+                """,
+                (symbol, interval, start_time, end_time),
+            ).fetchall()
+
+        return [
+            Candle(
+                open_time=row[0],
+                open=Decimal(row[1]),
+                high=Decimal(row[2]),
+                low=Decimal(row[3]),
+                close=Decimal(row[4]),
+                volume=Decimal(row[5]),
+                close_time=row[6],
+                quote_volume=Decimal(row[7]),
+                number_of_trades=row[8],
+                taker_buy_base_volume=Decimal(row[9]),
+                taker_buy_quote_volume=Decimal(row[10]),
+            )
+            for row in rows
+        ]
+
     def get_latest_open_time(self, symbol: str, interval: str) -> int | None:
         """Return the latest stored opening time, if any."""
         with sqlite3.connect(self._database_path) as connection:

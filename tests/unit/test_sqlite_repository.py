@@ -78,6 +78,19 @@ def test_get_candles_filters_by_symbol_and_interval(
     assert repository.get_candles("BTCUSDT", "1h") == [FIRST_CANDLE]
 
 
+def test_get_candles_by_range_uses_half_open_bounds(
+    repository: SQLiteRepository,
+) -> None:
+    repository.save_candles("BTCUSDT", "1h", [SECOND_CANDLE, FIRST_CANDLE])
+
+    assert repository.get_candles_by_range(
+        "BTCUSDT",
+        "1h",
+        start_time=1_000,
+        end_time=2_000,
+    ) == [FIRST_CANDLE]
+
+
 def test_decimal_values_are_stored_as_text_without_losing_precision(
     repository: SQLiteRepository,
     database_path: Path,
