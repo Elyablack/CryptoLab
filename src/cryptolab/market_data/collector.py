@@ -50,6 +50,16 @@ class HistoricalDataCollector:
             candles = parse_klines(raw_klines)
             validate_candles(candles)
 
+            if candles[0].open_time < current_start_time:
+                raise ValueError(
+                    "Binance returned a candle before the requested start_time"
+                )
+
+            if candles[-1].open_time >= end_time:
+                raise ValueError(
+                    "Binance returned a candle outside the requested end_time"
+                )
+
             last_open_time = candles[-1].open_time
             next_start_time = last_open_time + 1
             if next_start_time <= current_start_time:
