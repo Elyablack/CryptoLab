@@ -52,3 +52,27 @@ def test_get_klines_raises_for_http_error() -> None:
         client.get_klines(symbol="ETHUSDT", interval="1h", limit=50)
 
     assert error.value.response.status_code == 429
+
+
+def test_get_klines_sends_optional_time_range() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert dict(request.url.params) == {
+            "symbol": "BTCUSDT",
+            "interval": "1h",
+            "limit": "1000",
+            "startTime": "1700000000000",
+            "endTime": "1700003599999",
+        }
+        return httpx.Response(200, json=[])
+
+    client = BinanceSpotClient(transport=httpx.MockTransport(handler))
+
+    result = client.get_klines(
+        symbol="BTCUSDT",
+        interval="1h",
+        limit=1000,
+        start_time=1_700_000_000_000,
+        end_time=1_700_003_599_999,
+    )
+
+    assert result == []

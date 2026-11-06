@@ -20,13 +20,25 @@ class BinanceSpotClient:
         self._timeout = httpx.Timeout(timeout)
         self._transport = transport
 
-    def get_klines(self, symbol: str, interval: str, limit: int) -> Any:
+    def get_klines(
+        self,
+        symbol: str,
+        interval: str,
+        limit: int,
+        *,
+        start_time: int | None = None,
+        end_time: int | None = None,
+    ) -> Any:
         """Return the unmodified JSON response for a kline request."""
-        params = {
+        params: dict[str, str | int] = {
             "symbol": symbol,
             "interval": interval,
             "limit": limit,
         }
+        if start_time is not None:
+            params["startTime"] = start_time
+        if end_time is not None:
+            params["endTime"] = end_time
 
         with httpx.Client(
             timeout=self._timeout,
