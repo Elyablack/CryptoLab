@@ -37,9 +37,17 @@ def test_signal_values_have_explicit_spot_semantics() -> None:
     "changes",
     [
         {"strategy_name": ""},
+        {"symbol": "   "},
         {"signal_available_time": 0},
+        {"candle_open_time": "0"},
+        {"signal_available_time": True},
         {"reference_price": Decimal("0")},
+        {"reference_price": 100},
+        {"reference_price": Decimal("Infinity")},
         {"explanation": ""},
+        {"explanation": "   "},
+        {"diagnostics": {1: "invalid key"}},
+        {"diagnostics": {"nested": []}},
     ],
 )
 def test_strategy_decision_rejects_invalid_fields(

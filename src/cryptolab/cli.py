@@ -274,6 +274,7 @@ def _run_signals(
 
     for decision in actionable:
         print(
+            "available_at="
             f"{_format_utc_timestamp(decision.signal_available_time)} "
             f"{decision.strategy_name} {decision.signal.value} "
             f"price={decision.reference_price} — {decision.explanation}"

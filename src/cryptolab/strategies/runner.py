@@ -1,11 +1,44 @@
 """Sequential, look-ahead-safe strategy evaluation."""
 
 from collections.abc import Sequence
+from typing import overload
 
 from cryptolab.features.models import FeatureRow
 from cryptolab.market_data.intervals import get_interval_milliseconds
 from cryptolab.strategies.base import Strategy, make_decision
 from cryptolab.strategies.models import Signal, StrategyDecision
+
+
+class _HistoryView(Sequence[FeatureRow]):
+    """Read-only, constant-size view over an immutable feature-row tuple."""
+
+    __slots__ = ("_rows", "_indices")
+
+    def __init__(
+        self,
+        rows: tuple[FeatureRow, ...],
+        indices: range,
+    ) -> None:
+        self._rows = rows
+        self._indices = indices
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    @overload
+    def __getitem__(self, index: int) -> FeatureRow: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[FeatureRow]: ...
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> FeatureRow | Sequence[FeatureRow]:
+        if isinstance(index, slice):
+            return _HistoryView(self._rows, self._indices[index])
+
+        return self._rows[self._indices[index]]
 
 
 class StrategyRunner:
@@ -35,9 +68,10 @@ class StrategyRunner:
     ) -> list[StrategyDecision]:
         """Return one decision per eligible row and strategy.
 
-        Each strategy receives a tuple ending at the current row, so future
-        feature rows are never visible. ``as_of_time`` deterministically
-        excludes rows that were not available yet.
+        Each strategy receives a read-only sequence view ending at the current
+        row, so future feature rows are never visible and prefixes are not
+        copied. ``as_of_time`` deterministically excludes rows that were not
+        available yet.
         """
         self._validate_rows(interval, rows)
         eligible_rows = tuple(
@@ -48,7 +82,7 @@ class StrategyRunner:
         decisions: list[StrategyDecision] = []
 
         for index, row in enumerate(eligible_rows):
-            history = eligible_rows[: index + 1]
+            history = _HistoryView(eligible_rows, range(index + 1))
             for strategy in self._strategies:
                 if len(history) < strategy.minimum_history:
                     decision = make_decision(

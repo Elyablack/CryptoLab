@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import replace
 from decimal import Decimal
 
@@ -49,7 +50,7 @@ class SpyStrategy:
         self,
         symbol: str,
         interval: str,
-        history: tuple[FeatureRow, ...],
+        history: Sequence[FeatureRow],
     ):
         self.history_lengths.append(len(history))
         return make_decision(
@@ -72,6 +73,43 @@ def test_runner_never_exposes_future_rows_to_strategy() -> None:
     assert [decision.candle_open_time for decision in decisions] == [
         row.open_time for row in rows
     ]
+
+
+def test_history_view_supports_sequence_access_without_future_rows() -> None:
+    class BoundaryStrategy(SpyStrategy):
+        def __init__(self) -> None:
+            super().__init__(name="boundary")
+            self.observations: list[tuple[int, int, list[int]]] = []
+
+        def evaluate(
+            self,
+            symbol: str,
+            interval: str,
+            history: Sequence[FeatureRow],
+        ):
+            with pytest.raises(IndexError):
+                _ = history[len(history)]
+            with pytest.raises(TypeError):
+                history[0] = history[-1]  # type: ignore[index]
+
+            tail = history[-2:]
+            self.observations.append((
+                history[0].open_time,
+                history[-1].open_time,
+                [row.open_time for row in tail],
+            ))
+            return super().evaluate(symbol, interval, history)
+
+    rows = make_rows(4)
+    strategy = BoundaryStrategy()
+
+    StrategyRunner([strategy]).run("BTCUSDT", "1h", rows)
+
+    assert strategy.observations[-1] == (
+        rows[0].open_time,
+        rows[3].open_time,
+        [rows[2].open_time, rows[3].open_time],
+    )
 
 
 def test_runner_emits_explicit_warm_up_holds() -> None:

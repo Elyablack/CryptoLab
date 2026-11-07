@@ -100,7 +100,8 @@ def test_signals_prints_breakout_without_http(
     assert exit_code == 0
     output = capsys.readouterr().out
     assert "breakout BUY" in output
-    assert "2024-01-01T22:00:00Z" in output
+    assert "available_at=2024-01-01T22:00:00Z" in output
+    assert "available_at=2024-01-01T21:00:00Z" not in output
     assert "price=104" in output
 
 
