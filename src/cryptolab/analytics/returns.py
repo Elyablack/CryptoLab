@@ -57,7 +57,7 @@ def calculate_log_returns(
 def calculate_volatility(
     returns: Sequence[Decimal],
 ) -> Decimal | None:
-    """Calculate sample standard deviation of returns."""
+    """Calculate non-annualized sample standard deviation of returns."""
 
     if len(returns) < 2:
         return None
@@ -79,7 +79,7 @@ def calculate_volatility(
 def calculate_max_drawdown(
     candles: Sequence[Candle],
 ) -> Decimal | None:
-    """Calculate maximum close-to-close price drawdown."""
+    """Calculate maximum close-to-close drawdown as a non-positive return."""
 
     if not candles:
         return None
