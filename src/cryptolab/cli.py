@@ -7,10 +7,19 @@ from pathlib import Path
 
 from cryptolab.analytics.analyzer import MarketAnalyzer
 from cryptolab.analytics.formatter import format_market_report
+from cryptolab.features.builder import FeatureBuilder
 from cryptolab.market_data.client import BinanceSpotClient
 from cryptolab.market_data.collector import HistoricalDataCollector
 from cryptolab.market_data.data_quality import DataQualityChecker
 from cryptolab.storage.sqlite_repository import SQLiteRepository
+from cryptolab.strategies import (
+    BreakoutStrategy,
+    MeanReversionStrategy,
+    Signal,
+    StrategyRunner,
+    TrendFollowingStrategy,
+)
+from cryptolab.strategies.base import Strategy
 
 
 DEFAULT_DATABASE_PATH = Path("data/market_data.db")
@@ -36,6 +45,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "analyze":
         return _run_analyze(args, start_time, end_time, database_path)
+
+    if args.command == "signals":
+        return _run_signals(args, start_time, end_time, database_path)
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -192,6 +204,84 @@ def _run_analyze(
     return 0
 
 
+def _run_signals(
+    args: argparse.Namespace,
+    start_time: int,
+    end_time: int,
+    database_path: Path,
+) -> int:
+    """Generate research signals from stored historical candles."""
+    try:
+        if not database_path.is_file():
+            raise FileNotFoundError(
+                f"Database does not exist: {database_path}"
+            )
+
+        repository = SQLiteRepository(database_path)
+        quality_report = DataQualityChecker(repository).check(
+            symbol=args.symbol,
+            interval=args.interval,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        if quality_report.missing_candles:
+            raise ValueError(
+                "Cannot generate signals from incomplete historical data: "
+                f"{quality_report.missing_candles} candles are missing"
+            )
+        if quality_report.actual_candles != quality_report.expected_candles:
+            raise ValueError(
+                "Cannot generate signals: actual candle count differs "
+                "from expected count"
+            )
+
+        candles = repository.get_candles_by_range(
+            args.symbol,
+            args.interval,
+            start_time,
+            end_time,
+        )
+        rows = FeatureBuilder().build(
+            candles,
+            interval=args.interval,
+            as_of_time=end_time,
+        )
+        runner = StrategyRunner(_create_strategies(args.strategy))
+        decisions = runner.run(
+            args.symbol,
+            args.interval,
+            rows,
+            as_of_time=end_time,
+        )
+        actionable = [
+            decision
+            for decision in decisions
+            if decision.signal is not Signal.HOLD
+        ]
+    except Exception as error:
+        print(f"Signal generation failed: {error}", file=sys.stderr)
+        return 1
+
+    print(
+        "Historical signals: "
+        f"symbol={args.symbol}, interval={args.interval}, "
+        f"range=[{args.start.date()}, {args.end.date()}), "
+        f"strategy={args.strategy}, database={database_path}"
+    )
+    if not actionable:
+        print("No BUY/SELL signals found.")
+        return 0
+
+    for decision in actionable:
+        print(
+            f"{_format_utc_timestamp(decision.signal_available_time)} "
+            f"{decision.strategy_name} {decision.signal.value} "
+            f"price={decision.reference_price} — {decision.explanation}"
+        )
+
+    return 0
+
+
 def _create_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -227,6 +317,21 @@ def _create_parser() -> argparse.ArgumentParser:
         ),
     )
     _add_common_arguments(analyze_parser)
+
+    signals_parser = subparsers.add_parser(
+        "signals",
+        help="inspect historical research signals",
+        description=(
+            "Evaluate research strategies on stored historical candles; "
+            "no orders are created"
+        ),
+    )
+    _add_common_arguments(signals_parser)
+    signals_parser.add_argument(
+        "--strategy",
+        choices=("all", "trend", "mean-reversion", "breakout"),
+        default="all",
+    )
 
     return parser
 
@@ -295,6 +400,18 @@ def _format_utc_timestamp(
     )
 
     return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def _create_strategies(strategy_name: str) -> list[Strategy]:
+    strategies = {
+        "trend": TrendFollowingStrategy,
+        "mean-reversion": MeanReversionStrategy,
+        "breakout": BreakoutStrategy,
+    }
+    if strategy_name == "all":
+        return [factory() for factory in strategies.values()]
+
+    return [strategies[strategy_name]()]
 
 
 if __name__ == "__main__":

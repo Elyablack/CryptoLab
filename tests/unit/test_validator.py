@@ -4,7 +4,11 @@ from decimal import Decimal
 import pytest
 
 from cryptolab.market_data.models import Candle
-from cryptolab.market_data.validator import validate_candle, validate_candles
+from cryptolab.market_data.validator import (
+    validate_candle,
+    validate_candles,
+    validate_historical_candles,
+)
 
 
 VALID_CANDLE = Candle(
@@ -136,3 +140,24 @@ def test_validate_candles_rejects_non_increasing_open_time(open_time: int) -> No
         match="Invalid candle at index 1: open_time must be strictly greater",
     ):
         validate_candles([VALID_CANDLE, second_candle])
+
+
+def test_validate_historical_candles_uses_explicit_as_of_time() -> None:
+    candle = replace(
+        VALID_CANDLE,
+        open_time=0,
+        close_time=3_599_999,
+    )
+
+    validate_historical_candles(
+        [candle],
+        "1h",
+        as_of_time=3_600_000,
+    )
+
+    with pytest.raises(ValueError, match="not closed"):
+        validate_historical_candles(
+            [candle],
+            "1h",
+            as_of_time=3_599_999,
+        )

@@ -2,6 +2,10 @@
 
 from dataclasses import dataclass
 
+from cryptolab.market_data.intervals import (
+    INTERVAL_MILLISECONDS as SUPPORTED_INTERVAL_MILLISECONDS,
+    get_interval_milliseconds,
+)
 from cryptolab.storage.sqlite_repository import SQLiteRepository
 
 
@@ -29,14 +33,7 @@ class DataQualityChecker:
 
     MAX_MISSING_OPEN_TIMES = 1000
 
-    INTERVAL_MILLISECONDS = {
-        "1m": 60_000,
-        "5m": 5 * 60_000,
-        "15m": 15 * 60_000,
-        "1h": 60 * 60_000,
-        "4h": 4 * 60 * 60_000,
-        "1d": 24 * 60 * 60_000,
-    }
+    INTERVAL_MILLISECONDS = SUPPORTED_INTERVAL_MILLISECONDS
 
     def __init__(self, repository: SQLiteRepository) -> None:
         self._repository = repository
@@ -49,10 +46,7 @@ class DataQualityChecker:
         end_time: int,
     ) -> DataQualityReport:
         """Check candle completeness in the range [start_time, end_time)."""
-        try:
-            interval_milliseconds = self.INTERVAL_MILLISECONDS[interval]
-        except KeyError as error:
-            raise ValueError(f"Unsupported interval: {interval}") from error
+        interval_milliseconds = get_interval_milliseconds(interval)
 
         if end_time <= start_time:
             raise ValueError("end_time must be greater than start_time")
