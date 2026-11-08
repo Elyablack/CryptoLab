@@ -10,9 +10,12 @@ from cryptolab.backtesting.models import (
     BacktestReport,
     CompletedTrade,
     EquityPoint,
+    Fill,
     PortfolioState,
     SimulatedFill,
     SkippedDecision,
+    TrailingStopFill,
+    TrailingStopTriggerKind,
 )
 
 __all__ = [
@@ -22,8 +25,11 @@ __all__ = [
     "BenchmarkReport",
     "CompletedTrade",
     "EquityPoint",
+    "Fill",
     "PortfolioState",
     "SimulatedFill",
     "SkippedDecision",
+    "TrailingStopFill",
+    "TrailingStopTriggerKind",
     "calculate_benchmarks",
 ]

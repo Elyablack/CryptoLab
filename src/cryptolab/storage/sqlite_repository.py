@@ -1,6 +1,7 @@
 """SQLite storage for historical market candles."""
 
 import sqlite3
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
@@ -39,6 +40,45 @@ CREATE_CANDLES_TABLE_SQL = """
     )
 """
 
+SCHEMA_VERSION = 2
+LEGACY_BACKUP_TABLE = "candles_legacy_v1_backup"
+REQUIRED_CANDLE_COLUMNS = {
+    "exchange",
+    "market_type",
+    "symbol",
+    "interval",
+    "open_time",
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "close_time",
+    "quote_volume",
+    "number_of_trades",
+    "taker_buy_base_volume",
+    "taker_buy_quote_volume",
+}
+
+
+@dataclass(frozen=True)
+class CandleConflict:
+    """An incoming historical candle differs from the retained DB row."""
+
+    open_time: int
+    existing: Candle
+    incoming: Candle
+
+
+@dataclass(frozen=True)
+class SaveCandlesResult:
+    """Outcome of one atomic save operation."""
+
+    inserted: int
+    existing: int
+    conflicting: int
+    conflicts: tuple[CandleConflict, ...]
+
 
 class SQLiteRepository:
     """Store and retrieve exchange-isolated candles in local SQLite."""
@@ -47,8 +87,14 @@ class SQLiteRepository:
         self._database_path = database_path
 
     def init_schema(self) -> None:
-        """Create the current schema or migrate legacy Binance Spot rows."""
+        """Create, adopt, or safely migrate to the current schema version."""
         with sqlite3.connect(self._database_path) as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            if version > SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Database schema version {version} is newer than "
+                    f"supported version {SCHEMA_VERSION}"
+                )
             table_exists = connection.execute(
                 """
                 SELECT 1
@@ -58,6 +104,7 @@ class SQLiteRepository:
             ).fetchone()
             if table_exists is None:
                 connection.execute(CREATE_CANDLES_TABLE_SQL)
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
 
             columns = {
@@ -68,6 +115,13 @@ class SQLiteRepository:
             }
             identity_columns = {"exchange", "market_type"}
             if identity_columns <= columns:
+                missing_columns = REQUIRED_CANDLE_COLUMNS - columns
+                if missing_columns:
+                    raise RuntimeError(
+                        "Unsupported candles schema; missing columns: "
+                        + ", ".join(sorted(missing_columns))
+                    )
+                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 return
             if identity_columns & columns:
                 raise RuntimeError(
@@ -81,14 +135,26 @@ class SQLiteRepository:
     def _migrate_legacy_binance_spot_schema(
         connection: sqlite3.Connection,
     ) -> None:
-        """Rebuild the legacy table inside one SQLite transaction."""
+        """Copy legacy rows transactionally and retain a read-only backup."""
+        backup_exists = connection.execute(
+            """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = ?
+            """,
+            (LEGACY_BACKUP_TABLE,),
+        ).fetchone()
+        if backup_exists is not None:
+            raise RuntimeError(
+                f"Cannot migrate while backup table {LEGACY_BACKUP_TABLE} exists"
+            )
+
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
-            "ALTER TABLE candles RENAME TO candles_legacy_binance_spot"
+            f"ALTER TABLE candles RENAME TO {LEGACY_BACKUP_TABLE}"
         )
         connection.execute(CREATE_CANDLES_TABLE_SQL)
         connection.execute(
-            """
+            f"""
             INSERT INTO candles (
                 exchange,
                 market_type,
@@ -122,10 +188,21 @@ class SQLiteRepository:
                 number_of_trades,
                 taker_buy_base_volume,
                 taker_buy_quote_volume
-            FROM candles_legacy_binance_spot
+            FROM {LEGACY_BACKUP_TABLE}
             """
         )
-        connection.execute("DROP TABLE candles_legacy_binance_spot")
+        legacy_count = connection.execute(
+            f"SELECT COUNT(*) FROM {LEGACY_BACKUP_TABLE}"
+        ).fetchone()[0]
+        migrated_count = connection.execute(
+            "SELECT COUNT(*) FROM candles"
+        ).fetchone()[0]
+        if legacy_count != migrated_count:
+            raise RuntimeError(
+                "Legacy migration row count mismatch: "
+                f"source={legacy_count}, migrated={migrated_count}"
+            )
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def save_candles(
         self,
@@ -135,61 +212,79 @@ class SQLiteRepository:
         *,
         exchange: str = DEFAULT_EXCHANGE,
         market_type: str = SPOT_MARKET_TYPE,
-    ) -> None:
-        """Atomically save candles without overwriting existing rows."""
-        validate_market_identity(exchange, market_type)
-        rows = [
-            (
-                exchange,
-                market_type,
-                symbol,
-                interval,
-                candle.open_time,
-                str(candle.open),
-                str(candle.high),
-                str(candle.low),
-                str(candle.close),
-                str(candle.volume),
-                candle.close_time,
-                str(candle.quote_volume),
-                candle.number_of_trades,
-                _optional_decimal_text(candle.taker_buy_base_volume),
-                _optional_decimal_text(candle.taker_buy_quote_volume),
-            )
-            for candle in candles
-        ]
+    ) -> SaveCandlesResult:
+        """Atomically insert new candles and retain conflicting history.
 
+        An unchanged key/value pair is counted as ``existing``. If the same
+        market key already contains different candle values, the existing row
+        is retained and a ``CandleConflict`` is returned. Historical data is
+        never overwritten implicitly.
+        """
+        validate_market_identity(exchange, market_type)
+        inserted = 0
+        existing = 0
+        conflicts: list[CandleConflict] = []
         with sqlite3.connect(self._database_path) as connection:
-            connection.executemany(
-                """
-                INSERT INTO candles (
-                    exchange,
-                    market_type,
-                    symbol,
-                    interval,
-                    open_time,
-                    open,
-                    high,
-                    low,
-                    close,
-                    volume,
-                    close_time,
-                    quote_volume,
-                    number_of_trades,
-                    taker_buy_base_volume,
-                    taker_buy_quote_volume
+            for candle in candles:
+                row = connection.execute(
+                    f"""
+                    {self._candle_select_sql()}
+                    WHERE exchange = ?
+                        AND market_type = ?
+                        AND symbol = ?
+                        AND interval = ?
+                        AND open_time = ?
+                    """,
+                    (
+                        exchange,
+                        market_type,
+                        symbol,
+                        interval,
+                        candle.open_time,
+                    ),
+                ).fetchone()
+                if row is not None:
+                    retained = _row_to_candle(row)
+                    if retained == candle:
+                        existing += 1
+                    else:
+                        conflicts.append(CandleConflict(
+                            open_time=candle.open_time,
+                            existing=retained,
+                            incoming=candle,
+                        ))
+                    continue
+
+                connection.execute(
+                    """
+                    INSERT INTO candles (
+                        exchange, market_type, symbol, interval, open_time,
+                        open, high, low, close, volume, close_time,
+                        quote_volume, number_of_trades,
+                        taker_buy_base_volume, taker_buy_quote_volume
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    _candle_to_row(
+                        candle,
+                        exchange=exchange,
+                        market_type=market_type,
+                        symbol=symbol,
+                        interval=interval,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (
-                    exchange,
-                    market_type,
-                    symbol,
-                    interval,
-                    open_time
-                ) DO NOTHING
-                """,
-                rows,
-            )
+                inserted += 1
+
+        return SaveCandlesResult(
+            inserted=inserted,
+            existing=existing,
+            conflicting=len(conflicts),
+            conflicts=tuple(conflicts),
+        )
+
+    def get_schema_version(self) -> int:
+        """Return the SQLite user-version used for deterministic migrations."""
+        with sqlite3.connect(self._database_path) as connection:
+            return int(connection.execute("PRAGMA user_version").fetchone()[0])
 
     def get_candles(
         self,
@@ -298,6 +393,33 @@ class SQLiteRepository:
 
 def _optional_decimal_text(value: Decimal | None) -> str | None:
     return None if value is None else str(value)
+
+
+def _candle_to_row(
+    candle: Candle,
+    *,
+    exchange: str,
+    market_type: str,
+    symbol: str,
+    interval: str,
+) -> tuple[object, ...]:
+    return (
+        exchange,
+        market_type,
+        symbol,
+        interval,
+        candle.open_time,
+        str(candle.open),
+        str(candle.high),
+        str(candle.low),
+        str(candle.close),
+        str(candle.volume),
+        candle.close_time,
+        str(candle.quote_volume),
+        candle.number_of_trades,
+        _optional_decimal_text(candle.taker_buy_base_volume),
+        _optional_decimal_text(candle.taker_buy_quote_volume),
+    )
 
 
 def _optional_decimal(value: object) -> Decimal | None:

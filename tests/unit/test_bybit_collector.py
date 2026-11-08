@@ -1,6 +1,7 @@
 from cryptolab.market_data.collector import HistoricalDataCollector
 from cryptolab.market_data.models import Candle
 from cryptolab.market_data.parser import parse_bybit_klines
+from cryptolab.storage.sqlite_repository import SaveCandlesResult
 
 
 HOUR_MILLISECONDS = 3_600_000
@@ -65,9 +66,35 @@ class FakeRepository:
         *,
         exchange: str,
         market_type: str,
-    ) -> None:
+    ) -> SaveCandlesResult:
         self.saved.append(
             (symbol, interval, candles, exchange, market_type)
+        )
+        return SaveCandlesResult(len(candles), 0, 0, ())
+
+    def get_candles_by_range(
+        self,
+        symbol: str,
+        interval: str,
+        start_time: int,
+        end_time: int,
+        *,
+        exchange: str,
+        market_type: str,
+    ) -> list[Candle]:
+        return sorted(
+            (
+                candle
+                for stored_symbol, stored_interval, candles, stored_exchange,
+                stored_market_type in self.saved
+                for candle in candles
+                if stored_symbol == symbol
+                and stored_interval == interval
+                and stored_exchange == exchange
+                and stored_market_type == market_type
+                and start_time <= candle.open_time < end_time
+            ),
+            key=lambda candle: candle.open_time,
         )
 
 

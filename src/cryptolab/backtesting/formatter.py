@@ -3,7 +3,11 @@
 from collections import Counter
 from datetime import UTC, datetime
 
-from cryptolab.backtesting.models import BacktestReport
+from cryptolab.backtesting.models import (
+    BacktestReport,
+    SimulatedFill,
+    TrailingStopFill,
+)
 from cryptolab.strategies.models import Signal
 
 
@@ -18,6 +22,31 @@ def format_backtest_report(
         if report.win_rate is None
         else f"{report.win_rate * 100:.2f}%"
     )
+    execution_model = [
+        f"Initial cash:     {report.config.initial_cash:.2f} USDT",
+        f"Fee per fill:     {report.config.fee_rate * 100:.4f}%",
+        f"Adverse slippage: {report.config.slippage_rate * 100:.4f}%",
+    ]
+    if report.config.trailing_stop_rate is not None:
+        execution_model.append(
+            "Trailing stop:    "
+            f"{report.config.trailing_stop_rate * 100:.4f}%"
+        )
+
+    activity = [
+        f"Fills:            {len(report.fills)}",
+        f"Completed trades: {report.completed_trade_count}",
+        f"Win rate:         {win_rate}",
+        f"Open base asset:  {report.final_state.base_balance}",
+        f"Skipped signals:  {len(report.skipped_decisions)}",
+    ]
+    if report.config.trailing_stop_rate is not None:
+        trailing_exits = sum(
+            isinstance(fill, TrailingStopFill)
+            for fill in report.fills
+        )
+        activity.append(f"Trailing exits:   {trailing_exits}")
+
     lines = [
         "CryptoLab Backtest",
         "------------------------------",
@@ -28,9 +57,7 @@ def format_backtest_report(
         f"Interval:         {report.interval}",
         "",
         "Execution model",
-        f"Initial cash:     {report.config.initial_cash:.2f} USDT",
-        f"Fee per fill:     {report.config.fee_rate * 100:.4f}%",
-        f"Adverse slippage: {report.config.slippage_rate * 100:.4f}%",
+        *execution_model,
         "",
         "Performance",
         f"Final equity:     {report.final_equity:.8f} USDT",
@@ -45,11 +72,7 @@ def format_backtest_report(
         ),
         "",
         "Activity",
-        f"Fills:            {len(report.fills)}",
-        f"Completed trades: {report.completed_trade_count}",
-        f"Win rate:         {win_rate}",
-        f"Open base asset:  {report.final_state.base_balance}",
-        f"Skipped signals:  {len(report.skipped_decisions)}",
+        *activity,
     ]
 
     reasons = Counter(item.reason for item in report.skipped_decisions)
@@ -74,6 +97,29 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
         exit_fill = trade.exit_fill
         entry_cost = entry.quote_notional + entry.fee
         return_percentage = trade.pnl / entry_cost * 100
+        if isinstance(exit_fill, SimulatedFill):
+            exit_details = [
+                (
+                    "  Exit signal available/execution:  "
+                    f"{_format_timestamp(exit_fill.signal_available_time)} / "
+                    f"{_format_timestamp(exit_fill.execution_open_time)}"
+                ),
+            ]
+        else:
+            exit_details = [
+                (
+                    "  Exit trailing stop: "
+                    f"trigger={exit_fill.trigger_kind.value}, candle="
+                    f"{_format_timestamp(exit_fill.trigger_candle_open_time)}"
+                ),
+                (
+                    "  Stop levels: high_watermark="
+                    f"{exit_fill.high_watermark} USDT, "
+                    f"active_stop={exit_fill.active_stop_price} USDT, "
+                    "market_reference="
+                    f"{exit_fill.market_reference_price} USDT"
+                ),
+            ]
         lines.extend([
             f"Trade {index}:",
             (
@@ -81,11 +127,7 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
                 f"{_format_timestamp(entry.signal_available_time)} / "
                 f"{_format_timestamp(entry.execution_open_time)}"
             ),
-            (
-                "  Exit signal available/execution:  "
-                f"{_format_timestamp(exit_fill.signal_available_time)} / "
-                f"{_format_timestamp(exit_fill.execution_open_time)}"
-            ),
+            *exit_details,
             (
                 "  Prices: entry="
                 f"{entry.execution_price} USDT, "

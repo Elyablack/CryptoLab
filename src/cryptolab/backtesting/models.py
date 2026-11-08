@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 
 from cryptolab.strategies.models import Signal, StrategyDecision
 
@@ -13,6 +14,7 @@ class BacktestConfig:
     initial_cash: Decimal = Decimal("1000")
     fee_rate: Decimal = Decimal("0.001")
     slippage_rate: Decimal = Decimal("0.0005")
+    trailing_stop_rate: Decimal | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -31,6 +33,12 @@ class BacktestConfig:
                 or not Decimal("0") <= value < 1
             ):
                 raise ValueError(f"{name} must be between 0 (inclusive) and 1")
+        if self.trailing_stop_rate is not None and (
+            not isinstance(self.trailing_stop_rate, Decimal)
+            or not self.trailing_stop_rate.is_finite()
+            or not Decimal("0") < self.trailing_stop_rate < 1
+        ):
+            raise ValueError("trailing_stop_rate must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -61,12 +69,43 @@ class SimulatedFill:
     base_balance_after: Decimal
 
 
+class TrailingStopTriggerKind(str, Enum):
+    """How an active trailing stop was crossed within an OHLC candle."""
+
+    GAP_OPEN = "gap_open"
+    INTRABAR = "intrabar"
+
+
+@dataclass(frozen=True)
+class TrailingStopFill:
+    """A stop-market SELL without fabricated strategy signal timestamps."""
+
+    trigger_kind: TrailingStopTriggerKind
+    trigger_candle_open_time: int
+    high_watermark: Decimal
+    active_stop_price: Decimal
+    market_reference_price: Decimal
+    execution_price: Decimal
+    base_quantity: Decimal
+    quote_notional: Decimal
+    fee: Decimal
+    quote_balance_after: Decimal
+    base_balance_after: Decimal
+
+    @property
+    def side(self) -> Signal:
+        return Signal.SELL
+
+
+Fill = SimulatedFill | TrailingStopFill
+
+
 @dataclass(frozen=True)
 class CompletedTrade:
     """One completed long trade from BUY fill through SELL fill."""
 
     entry_fill: SimulatedFill
-    exit_fill: SimulatedFill
+    exit_fill: Fill
     pnl: Decimal
 
 
@@ -110,7 +149,7 @@ class BacktestReport:
     unrealized_pnl: Decimal
     total_pnl: Decimal
     maximum_equity_drawdown: Decimal
-    fills: tuple[SimulatedFill, ...]
+    fills: tuple[Fill, ...]
     completed_trades: tuple[CompletedTrade, ...]
     skipped_decisions: tuple[SkippedDecision, ...]
     equity_curve: tuple[EquityPoint, ...]

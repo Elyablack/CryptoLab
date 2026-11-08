@@ -73,6 +73,7 @@ def test_backtest_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--strategy" in output
     assert "--fee-rate" in output
     assert "--show-trades" in output
+    assert "--trailing-stop-rate" in output
     assert "no exchange orders are created" in " ".join(output.split())
 
 
@@ -100,6 +101,7 @@ def test_backtest_all_runs_three_independent_bybit_portfolios_without_http(
     assert "Strategy:         mean_reversion" in output
     assert "Strategy:         breakout" in output
     assert output.count("Exchange:         bybit") == 3
+    assert "Trailing stop:" not in output
 
 
 def test_backtest_single_strategy_uses_configured_fee(
@@ -140,6 +142,28 @@ def test_backtest_show_trades_enables_optional_details(
     output = capsys.readouterr().out
     assert "Completed trade details" in output
     assert "No completed trades." in output
+
+
+def test_backtest_accepts_optional_trailing_stop_rate(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "market_data.db"
+    save_bybit_candles(database_path, make_hourly_candles(72))
+    arguments = backtest_arguments(database_path)
+    arguments.extend([
+        "--strategy",
+        "trend",
+        "--trailing-stop-rate",
+        "0.10",
+    ])
+
+    exit_code = main(arguments)
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Trailing stop:    10.0000%" in output
+    assert "Trailing exits:   0" in output
 
 
 def test_backtest_rejects_incomplete_selected_exchange(
@@ -186,6 +210,33 @@ def test_backtest_rejects_invalid_fee_rate(fee_rate: str) -> None:
             "2024-01-04",
             "--fee-rate",
             fee_rate,
+        ])
+
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "trailing_stop_rate",
+    ["invalid", "0", "-0.1", "1", "NaN", "Infinity"],
+)
+def test_backtest_rejects_invalid_trailing_stop_rate(
+    trailing_stop_rate: str,
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        main([
+            "backtest",
+            "--exchange",
+            "bybit",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "1h",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-04",
+            "--trailing-stop-rate",
+            trailing_stop_rate,
         ])
 
     assert error.value.code == 2

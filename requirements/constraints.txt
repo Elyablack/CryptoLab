@@ -1,0 +1,18 @@
+# Reproducible Python 3.12/3.13 test environment for CryptoLab v1.0.
+anyio==4.16.0
+certifi==2026.10.23
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+Pygments==2.21.0
+pytest==9.2.0
+typing_extensions==4.16.0
+
+# Release tooling (not runtime dependencies).
+build==1.6.1
+pip-audit==2.10.1
+ruff==0.17.4

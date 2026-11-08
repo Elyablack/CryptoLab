@@ -1,6 +1,7 @@
 """Command-line interface for CryptoLab."""
 
 import argparse
+import logging
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -13,7 +14,11 @@ from cryptolab.backtesting.formatter import format_backtest_report
 from cryptolab.features.builder import FeatureBuilder
 from cryptolab.market_data.bybit_client import BybitSpotClient
 from cryptolab.market_data.client import BinanceSpotClient
-from cryptolab.market_data.collector import HistoricalDataCollector
+from cryptolab.market_data.collector import (
+    CollectionFailure,
+    CollectionResult,
+    HistoricalDataCollector,
+)
 from cryptolab.market_data.data_quality import DataQualityChecker
 from cryptolab.market_data.markets import (
     DEFAULT_EXCHANGE,
@@ -35,12 +40,14 @@ from cryptolab.strategies.base import Strategy
 
 
 DEFAULT_DATABASE_PATH = Path("data/market_data.db")
+LOGGER = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
     """Run the CryptoLab command-line interface."""
     parser = _create_parser()
     args = parser.parse_args(argv)
+    _configure_logging(args.verbose)
 
     if args.end <= args.start:
         parser.error("--end must be later than --start")
@@ -98,15 +105,30 @@ def _run_collect(
                 pagination_direction="backward",
             )
 
-        collector.collect(
+        result = collector.collect(
             symbol=args.symbol,
             interval=args.interval,
             start_time=start_time,
             end_time=end_time,
         )
 
+    except CollectionFailure as error:
+        _print_collection_summary(error.result)
+        print(f"Collection failed: {error}", file=sys.stderr)
+        LOGGER.debug("Collection failure details", exc_info=True)
+        return 1
     except Exception as error:
         print(f"Collection failed: {error}", file=sys.stderr)
+        LOGGER.debug("Collection failure details", exc_info=True)
+        return 1
+
+    _print_collection_summary(result)
+    if not result.succeeded:
+        print(
+            "Collection incomplete: "
+            f"{result.failure_reason or 'coverage validation failed'}",
+            file=sys.stderr,
+        )
         return 1
 
     print(
@@ -140,6 +162,7 @@ def _run_quality(
 
     except Exception as error:
         print(f"Quality check failed: {error}", file=sys.stderr)
+        LOGGER.debug("Quality-check failure details", exc_info=True)
         return 1
 
     print(
@@ -153,6 +176,9 @@ def _run_quality(
     print(f"expected_candles={report.expected_candles}")
     print(f"actual_candles={report.actual_candles}")
     print(f"missing_candles={report.missing_candles}")
+    print(f"unexpected_candles={report.unexpected_candles}")
+    print(f"duplicate_candles={report.duplicate_candles}")
+    print(f"invalid_candles={report.invalid_candles}")
 
     if report.missing_open_times:
         print("missing_open_times (UTC):")
@@ -167,7 +193,20 @@ def _run_quality(
             f"of {report.missing_candles}"
         )
 
-    return 1 if report.missing_candles else 0
+    if report.unexpected_open_times:
+        print("unexpected_open_times (UTC):")
+        for open_time in report.unexpected_open_times:
+            print(f"  {_format_utc_timestamp(open_time)}")
+    if report.duplicate_open_times:
+        print("duplicate_open_times (UTC):")
+        for open_time in report.duplicate_open_times:
+            print(f"  {_format_utc_timestamp(open_time)}")
+    if report.invalid_reasons:
+        print("invalid_candle_details:")
+        for reason in report.invalid_reasons:
+            print(f"  {reason}")
+
+    return 0 if report.is_valid else 1
 
 
 def _run_analyze(
@@ -228,6 +267,7 @@ def _run_analyze(
 
     except Exception as error:
         print(f"Analysis failed: {error}", file=sys.stderr)
+        LOGGER.debug("Analysis failure details", exc_info=True)
         return 1
 
     print(
@@ -300,6 +340,7 @@ def _run_signals(
         ]
     except Exception as error:
         print(f"Signal generation failed: {error}", file=sys.stderr)
+        LOGGER.debug("Signal-generation failure details", exc_info=True)
         return 1
 
     print(
@@ -368,7 +409,10 @@ def _run_backtest(
             interval=args.interval,
             as_of_time=end_time,
         )
-        engine = BacktestEngine(BacktestConfig(fee_rate=args.fee_rate))
+        engine = BacktestEngine(BacktestConfig(
+            fee_rate=args.fee_rate,
+            trailing_stop_rate=args.trailing_stop_rate,
+        ))
         reports = [
             engine.run(
                 strategy,
@@ -383,6 +427,7 @@ def _run_backtest(
         ]
     except Exception as error:
         print(f"Backtest failed: {error}", file=sys.stderr)
+        LOGGER.debug("Backtest failure details", exc_info=True)
         return 1
 
     print(
@@ -450,6 +495,7 @@ def _run_research(
         )
     except Exception as error:
         print(f"Research failed: {error}", file=sys.stderr)
+        LOGGER.debug("Research failure details", exc_info=True)
         return 1
 
     print(format_research_report(report))
@@ -533,6 +579,13 @@ def _create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="show completed trades, open position, and skipped signals",
     )
+    backtest_parser.add_argument(
+        "--trailing-stop-rate",
+        type=_parse_positive_decimal_rate,
+        default=None,
+        metavar="DECIMAL",
+        help="optional trailing-stop fraction, for example 0.05 = 5%%",
+    )
 
     research_parser = subparsers.add_parser(
         "research",
@@ -594,6 +647,11 @@ def _add_common_arguments(
         default=DEFAULT_DATABASE_PATH,
         metavar="PATH",
     )
+    command_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show debug diagnostics on stderr",
+    )
 
 
 def _parse_utc_date(value: str) -> datetime:
@@ -641,6 +699,16 @@ def _parse_decimal_rate(value: str) -> Decimal:
     return result
 
 
+def _parse_positive_decimal_rate(value: str) -> Decimal:
+    """Parse a finite decimal fraction in the range (0, 1)."""
+    result = _parse_decimal_rate(value)
+    if result == 0:
+        raise argparse.ArgumentTypeError(
+            "rate must be between 0 and 1"
+        )
+    return result
+
+
 def _create_strategies(strategy_name: str) -> list[Strategy]:
     strategies = {
         "trend": TrendFollowingStrategy,
@@ -661,6 +729,40 @@ def _market_identity_kwargs(exchange: str) -> dict[str, str]:
         "exchange": exchange,
         "market_type": SPOT_MARKET_TYPE,
     }
+
+
+def _configure_logging(verbose: bool) -> None:
+    """Configure dependency-free operational logging for one CLI run."""
+    level = logging.DEBUG if verbose else logging.WARNING
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    root_logger.setLevel(level)
+
+
+def _print_collection_summary(result: CollectionResult) -> None:
+    print(
+        "Collection summary: "
+        f"exchange={result.exchange}, market_type={result.market_type}, "
+        f"symbol={result.symbol}, interval={result.interval}, "
+        f"expected={result.expected}, received={result.received}, "
+        f"inserted={result.inserted}, existing={result.existing}, "
+        f"conflicting={result.conflicting}, missing={result.missing}, "
+        f"invalid={result.invalid}, unexpected={result.unexpected}, "
+        f"excluded_unfinished={result.excluded_unfinished}, "
+        f"empty_pages={result.empty_pages}"
+    )
+    if result.conflict_open_times:
+        print("conflict_open_times (UTC):")
+        for open_time in result.conflict_open_times:
+            print(f"  {_format_utc_timestamp(open_time)}")
+    if result.missing_open_times:
+        print("missing_open_times (UTC):")
+        for open_time in result.missing_open_times:
+            print(f"  {_format_utc_timestamp(open_time)}")
 
 
 if __name__ == "__main__":

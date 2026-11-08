@@ -1,4 +1,9 @@
-# CryptoLab Strategy Research — Phase 1
+# CryptoLab Strategy Research — Phase 1 historical snapshot
+
+> This document records the original October 2026 one-month investigation.
+> It is not a statement of the database's current coverage. Generated research
+> reports are local runtime artifacts; reproduce current results with
+> `cryptolab quality` followed by `cryptolab research` for an explicit range.
 
 Этот отчёт фиксирует воспроизводимый baseline, а не попытку подобрать
 параметры для положительной доходности.
