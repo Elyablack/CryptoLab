@@ -17,6 +17,11 @@ from cryptolab.analytics.returns import (
     calculate_volatility,
 )
 from cryptolab.market_data.models import Candle
+from cryptolab.market_data.markets import (
+    DEFAULT_EXCHANGE,
+    SPOT_MARKET_TYPE,
+    validate_market_identity,
+)
 from cryptolab.market_data.validator import validate_historical_candles
 
 
@@ -32,7 +37,10 @@ class MarketAnalyzer:
         candles: Sequence[Candle],
         *,
         as_of_time: int | None = None,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = SPOT_MARKET_TYPE,
     ) -> MarketAnalysisReport:
+        validate_market_identity(exchange, market_type)
         if len(candles) < self.MIN_CANDLES:
             raise ValueError(
                 f"At least {self.MIN_CANDLES} candles are required"
@@ -89,4 +97,6 @@ class MarketAnalyzer:
             rsi14=rsi14,
             atr14=atr14,
             relative_volume20=rvol20,
+            exchange=exchange,
+            market_type=market_type,
         )

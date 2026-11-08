@@ -6,6 +6,11 @@ from cryptolab.market_data.intervals import (
     INTERVAL_MILLISECONDS as SUPPORTED_INTERVAL_MILLISECONDS,
     get_interval_milliseconds,
 )
+from cryptolab.market_data.markets import (
+    DEFAULT_EXCHANGE,
+    SPOT_MARKET_TYPE,
+    validate_market_identity,
+)
 from cryptolab.storage.sqlite_repository import SQLiteRepository
 
 
@@ -26,6 +31,8 @@ class DataQualityReport:
     actual_candles: int
     missing_candles: int
     missing_open_times: tuple[int, ...]
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = SPOT_MARKET_TYPE
 
 
 class DataQualityChecker:
@@ -44,8 +51,12 @@ class DataQualityChecker:
         interval: str,
         start_time: int,
         end_time: int,
+        *,
+        exchange: str = DEFAULT_EXCHANGE,
+        market_type: str = SPOT_MARKET_TYPE,
     ) -> DataQualityReport:
         """Check candle completeness in the range [start_time, end_time)."""
+        validate_market_identity(exchange, market_type)
         interval_milliseconds = get_interval_milliseconds(interval)
 
         if end_time <= start_time:
@@ -57,12 +68,22 @@ class DataQualityChecker:
         if end_time % interval_milliseconds != 0:
             raise ValueError("end_time must be aligned to the interval")
 
-        candles = self._repository.get_candles_by_range(
-            symbol,
-            interval,
-            start_time,
-            end_time,
-        )
+        if exchange == DEFAULT_EXCHANGE and market_type == SPOT_MARKET_TYPE:
+            candles = self._repository.get_candles_by_range(
+                symbol,
+                interval,
+                start_time,
+                end_time,
+            )
+        else:
+            candles = self._repository.get_candles_by_range(
+                symbol,
+                interval,
+                start_time,
+                end_time,
+                exchange=exchange,
+                market_type=market_type,
+            )
         actual_open_times = {candle.open_time for candle in candles}
         expected_open_times = range(
             start_time,
@@ -90,5 +111,7 @@ class DataQualityChecker:
             actual_candles=len(candles),
             missing_candles=missing_candles,
             missing_open_times=tuple(missing_open_times),
+            exchange=exchange,
+            market_type=market_type,
         )
 

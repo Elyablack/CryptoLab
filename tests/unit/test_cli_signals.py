@@ -36,10 +36,21 @@ def make_hourly_candles(count: int) -> list[Candle]:
     return candles
 
 
-def save_candles(database_path: Path, candles: list[Candle]) -> None:
+def save_candles(
+    database_path: Path,
+    candles: list[Candle],
+    *,
+    exchange: str = "binance",
+) -> None:
     repository = SQLiteRepository(database_path)
     repository.init_schema()
-    repository.save_candles("BTCUSDT", "1h", candles)
+    repository.save_candles(
+        "BTCUSDT",
+        "1h",
+        candles,
+        exchange=exchange,
+        market_type="spot",
+    )
 
 
 def signal_arguments(database_path: Path, strategy: str = "all") -> list[str]:
@@ -116,6 +127,25 @@ def test_signals_reports_no_actionable_signal(
 
     assert exit_code == 0
     assert "No BUY/SELL signals found" in capsys.readouterr().out
+
+
+def test_signals_reads_only_selected_exchange(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "market_data.db"
+    candles = make_hourly_candles(72)
+    save_candles(database_path, candles[:10], exchange="binance")
+    save_candles(database_path, candles, exchange="bybit")
+    arguments = signal_arguments(database_path)
+    arguments[1:1] = ["--exchange", "bybit"]
+
+    exit_code = main(arguments)
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "exchange=bybit" in output
+    assert "No BUY/SELL signals found" in output
 
 
 def test_signals_rejects_incomplete_data(

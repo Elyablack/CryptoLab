@@ -38,20 +38,28 @@ def validate_candle(candle: Candle) -> None:
     volumes = {
         "volume": candle.volume,
         "quote_volume": candle.quote_volume,
-        "taker_buy_base_volume": candle.taker_buy_base_volume,
-        "taker_buy_quote_volume": candle.taker_buy_quote_volume,
     }
+    if candle.taker_buy_base_volume is not None:
+        volumes["taker_buy_base_volume"] = candle.taker_buy_base_volume
+    if candle.taker_buy_quote_volume is not None:
+        volumes["taker_buy_quote_volume"] = candle.taker_buy_quote_volume
     for field_name, value in volumes.items():
         if value < 0:
             raise ValueError(f"{field_name} must be non-negative")
 
-    if candle.taker_buy_base_volume > candle.volume:
+    if (
+        candle.taker_buy_base_volume is not None
+        and candle.taker_buy_base_volume > candle.volume
+    ):
         raise ValueError("taker_buy_base_volume cannot exceed volume")
 
-    if candle.taker_buy_quote_volume > candle.quote_volume:
+    if (
+        candle.taker_buy_quote_volume is not None
+        and candle.taker_buy_quote_volume > candle.quote_volume
+    ):
         raise ValueError("taker_buy_quote_volume cannot exceed quote_volume")
 
-    if candle.number_of_trades < 0:
+    if candle.number_of_trades is not None and candle.number_of_trades < 0:
         raise ValueError("number_of_trades must be non-negative")
 
     if candle.open_time < 0:

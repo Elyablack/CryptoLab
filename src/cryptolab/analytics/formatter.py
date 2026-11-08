@@ -15,6 +15,8 @@ def format_market_report(report: MarketAnalysisReport) -> str:
         [
             "CryptoLab Market Analysis",
             "------------------------------",
+            f"Exchange:        {report.exchange}",
+            f"Market type:     {report.market_type}",
             f"Symbol:          {report.symbol}",
             f"Interval:        {report.interval}",
             f"Candles:         {report.candles_analyzed}",

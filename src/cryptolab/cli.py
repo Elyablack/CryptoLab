@@ -8,9 +8,16 @@ from pathlib import Path
 from cryptolab.analytics.analyzer import MarketAnalyzer
 from cryptolab.analytics.formatter import format_market_report
 from cryptolab.features.builder import FeatureBuilder
+from cryptolab.market_data.bybit_client import BybitSpotClient
 from cryptolab.market_data.client import BinanceSpotClient
 from cryptolab.market_data.collector import HistoricalDataCollector
 from cryptolab.market_data.data_quality import DataQualityChecker
+from cryptolab.market_data.markets import (
+    DEFAULT_EXCHANGE,
+    SPOT_MARKET_TYPE,
+    SUPPORTED_EXCHANGES,
+)
+from cryptolab.market_data.parser import parse_bybit_klines
 from cryptolab.storage.sqlite_repository import SQLiteRepository
 from cryptolab.strategies import (
     BreakoutStrategy,
@@ -66,8 +73,19 @@ def _run_collect(
         repository = SQLiteRepository(database_path)
         repository.init_schema()
 
-        client = BinanceSpotClient()
-        collector = HistoricalDataCollector(client, repository)
+        if args.exchange == DEFAULT_EXCHANGE:
+            client = BinanceSpotClient()
+            collector = HistoricalDataCollector(client, repository)
+        else:
+            bybit_client = BybitSpotClient()
+            collector = HistoricalDataCollector(
+                bybit_client,
+                repository,
+                exchange=args.exchange,
+                market_type=SPOT_MARKET_TYPE,
+                parser=parse_bybit_klines,
+                pagination_direction="backward",
+            )
 
         collector.collect(
             symbol=args.symbol,
@@ -82,6 +100,7 @@ def _run_collect(
 
     print(
         "Collection completed: "
+        f"exchange={args.exchange}, market_type={SPOT_MARKET_TYPE}, "
         f"symbol={args.symbol}, interval={args.interval}, "
         f"range=[{args.start.date()}, {args.end.date()}), "
         f"database={database_path}"
@@ -98,12 +117,14 @@ def _run_quality(
     """Check completeness of stored historical candles."""
     try:
         repository = SQLiteRepository(database_path)
+        repository.init_schema()
 
         report = DataQualityChecker(repository).check(
             symbol=args.symbol,
             interval=args.interval,
             start_time=start_time,
             end_time=end_time,
+            **_market_identity_kwargs(args.exchange),
         )
 
     except Exception as error:
@@ -112,6 +133,7 @@ def _run_quality(
 
     print(
         "Quality report: "
+        f"exchange={report.exchange}, market_type={report.market_type}, "
         f"symbol={report.symbol}, interval={report.interval}, "
         f"range=[{args.start.date()}, {args.end.date()}), "
         f"database={database_path}"
@@ -151,12 +173,14 @@ def _run_analyze(
             )
 
         repository = SQLiteRepository(database_path)
+        repository.init_schema()
 
         quality_report = DataQualityChecker(repository).check(
             symbol=args.symbol,
             interval=args.interval,
             start_time=start_time,
             end_time=end_time,
+            **_market_identity_kwargs(args.exchange),
         )
 
         if quality_report.missing_candles > 0:
@@ -179,12 +203,14 @@ def _run_analyze(
             interval=args.interval,
             start_time=start_time,
             end_time=end_time,
+            **_market_identity_kwargs(args.exchange),
         )
 
         report = MarketAnalyzer().analyze(
             symbol=args.symbol,
             interval=args.interval,
             candles=candles,
+            **_market_identity_kwargs(args.exchange),
         )
 
         output = format_market_report(report)
@@ -218,11 +244,13 @@ def _run_signals(
             )
 
         repository = SQLiteRepository(database_path)
+        repository.init_schema()
         quality_report = DataQualityChecker(repository).check(
             symbol=args.symbol,
             interval=args.interval,
             start_time=start_time,
             end_time=end_time,
+            **_market_identity_kwargs(args.exchange),
         )
         if quality_report.missing_candles:
             raise ValueError(
@@ -240,6 +268,7 @@ def _run_signals(
             args.interval,
             start_time,
             end_time,
+            **_market_identity_kwargs(args.exchange),
         )
         rows = FeatureBuilder().build(
             candles,
@@ -264,6 +293,7 @@ def _run_signals(
 
     print(
         "Historical signals: "
+        f"exchange={args.exchange}, market_type={SPOT_MARKET_TYPE}, "
         f"symbol={args.symbol}, interval={args.interval}, "
         f"range=[{args.start.date()}, {args.end.date()}), "
         f"strategy={args.strategy}, database={database_path}"
@@ -297,8 +327,8 @@ def _create_parser() -> argparse.ArgumentParser:
 
     collect_parser = subparsers.add_parser(
         "collect",
-        help="collect historical Binance Spot candles",
-        description="Collect historical Binance Spot candles",
+        help="collect historical public Spot candles",
+        description="Collect historical Binance or Bybit Spot candles",
     )
     _add_common_arguments(collect_parser)
 
@@ -341,6 +371,12 @@ def _add_common_arguments(
     command_parser: argparse.ArgumentParser,
 ) -> None:
     """Add shared arguments to a CLI subcommand."""
+    command_parser.add_argument(
+        "--exchange",
+        choices=SUPPORTED_EXCHANGES,
+        default=DEFAULT_EXCHANGE,
+    )
+
     command_parser.add_argument(
         "--symbol",
         required=True,
@@ -413,6 +449,16 @@ def _create_strategies(strategy_name: str) -> list[Strategy]:
         return [factory() for factory in strategies.values()]
 
     return [strategies[strategy_name]()]
+
+
+def _market_identity_kwargs(exchange: str) -> dict[str, str]:
+    """Keep legacy Binance calls positional while scoping other exchanges."""
+    if exchange == DEFAULT_EXCHANGE:
+        return {}
+    return {
+        "exchange": exchange,
+        "market_type": SPOT_MARKET_TYPE,
+    }
 
 
 if __name__ == "__main__":

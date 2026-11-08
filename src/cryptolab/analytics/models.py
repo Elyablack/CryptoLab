@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from decimal import Decimal
 
+from cryptolab.market_data.markets import DEFAULT_EXCHANGE, SPOT_MARKET_TYPE
+
 
 @dataclass(frozen=True)
 class MarketAnalysisReport:
@@ -28,6 +30,8 @@ class MarketAnalysisReport:
     rsi14: Decimal
     atr14: Decimal
     relative_volume20: Decimal
+    exchange: str = DEFAULT_EXCHANGE
+    market_type: str = SPOT_MARKET_TYPE
 
     @property
     def atr_percent(self) -> Decimal:

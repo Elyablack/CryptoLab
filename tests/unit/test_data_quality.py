@@ -202,3 +202,31 @@ def test_check_queries_only_requested_range() -> None:
     checker.check("BTCUSDT", "1h", 3_600_000, 7_200_000)
 
     assert repository.call == ("BTCUSDT", "1h", 3_600_000, 7_200_000)
+
+
+def test_check_isolates_identical_markets_by_exchange(
+    repository: SQLiteRepository,
+) -> None:
+    candle = make_candle(0, 60_000)
+    repository.save_candles("BTCUSDT", "1m", [candle])
+
+    binance_report = DataQualityChecker(repository).check(
+        "BTCUSDT",
+        "1m",
+        0,
+        60_000,
+    )
+    bybit_report = DataQualityChecker(repository).check(
+        "BTCUSDT",
+        "1m",
+        0,
+        60_000,
+        exchange="bybit",
+        market_type="spot",
+    )
+
+    assert binance_report.actual_candles == 1
+    assert binance_report.exchange == "binance"
+    assert bybit_report.actual_candles == 0
+    assert bybit_report.missing_candles == 1
+    assert bybit_report.exchange == "bybit"

@@ -145,7 +145,7 @@ def test_save_candles_rolls_back_entire_batch_on_error(
 ) -> None:
     invalid_candle = replace(
         SECOND_CANDLE,
-        number_of_trades=None,  # type: ignore[arg-type]
+        close_time=None,  # type: ignore[arg-type]
     )
 
     with pytest.raises(sqlite3.IntegrityError):
@@ -156,3 +156,121 @@ def test_save_candles_rolls_back_entire_batch_on_error(
         )
 
     assert repository.get_candles("BTCUSDT", "1h") == []
+
+
+def test_init_schema_migrates_legacy_rows_to_binance_spot(
+    database_path: Path,
+) -> None:
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE candles (
+                symbol TEXT NOT NULL,
+                interval TEXT NOT NULL,
+                open_time INTEGER NOT NULL,
+                open TEXT NOT NULL,
+                high TEXT NOT NULL,
+                low TEXT NOT NULL,
+                close TEXT NOT NULL,
+                volume TEXT NOT NULL,
+                close_time INTEGER NOT NULL,
+                quote_volume TEXT NOT NULL,
+                number_of_trades INTEGER NOT NULL,
+                taker_buy_base_volume TEXT NOT NULL,
+                taker_buy_quote_volume TEXT NOT NULL,
+                PRIMARY KEY (symbol, interval, open_time)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO candles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "BTCUSDT",
+                "1h",
+                FIRST_CANDLE.open_time,
+                str(FIRST_CANDLE.open),
+                str(FIRST_CANDLE.high),
+                str(FIRST_CANDLE.low),
+                str(FIRST_CANDLE.close),
+                str(FIRST_CANDLE.volume),
+                FIRST_CANDLE.close_time,
+                str(FIRST_CANDLE.quote_volume),
+                FIRST_CANDLE.number_of_trades,
+                str(FIRST_CANDLE.taker_buy_base_volume),
+                str(FIRST_CANDLE.taker_buy_quote_volume),
+            ),
+        )
+
+    repository = SQLiteRepository(database_path)
+    repository.init_schema()
+    repository.init_schema()
+
+    assert repository.get_candles("BTCUSDT", "1h") == [FIRST_CANDLE]
+    with sqlite3.connect(database_path) as connection:
+        identity = connection.execute(
+            "SELECT exchange, market_type FROM candles"
+        ).fetchone()
+        primary_key = [
+            row[1]
+            for row in connection.execute("PRAGMA table_info(candles)")
+            if row[5]
+        ]
+        legacy_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type = 'table' AND name = 'candles_legacy_binance_spot'
+            """
+        ).fetchone()
+
+    assert identity == ("binance", "spot")
+    assert primary_key == [
+        "exchange",
+        "market_type",
+        "symbol",
+        "interval",
+        "open_time",
+    ]
+    assert legacy_table is None
+
+
+def test_same_candle_key_is_isolated_by_exchange(
+    repository: SQLiteRepository,
+    database_path: Path,
+) -> None:
+    bybit_candle = replace(
+        FIRST_CANDLE,
+        close=Decimal("111.5000"),
+        number_of_trades=None,
+        taker_buy_base_volume=None,
+        taker_buy_quote_volume=None,
+    )
+    repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
+    repository.save_candles(
+        "BTCUSDT",
+        "1h",
+        [bybit_candle],
+        exchange="bybit",
+        market_type="spot",
+    )
+
+    assert repository.get_candles("BTCUSDT", "1h") == [FIRST_CANDLE]
+    assert repository.get_candles(
+        "BTCUSDT",
+        "1h",
+        exchange="bybit",
+        market_type="spot",
+    ) == [bybit_candle]
+    with sqlite3.connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT exchange, number_of_trades, taker_buy_base_volume
+            FROM candles ORDER BY exchange
+            """
+        ).fetchall()
+
+    assert rows == [
+        ("binance", 25, "6.7000"),
+        ("bybit", None, None),
+    ]

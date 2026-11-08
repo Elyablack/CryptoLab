@@ -41,10 +41,21 @@ def make_hourly_candles(
     return candles
 
 
-def save_candles(database_path: Path, candles: list[Candle]) -> None:
+def save_candles(
+    database_path: Path,
+    candles: list[Candle],
+    *,
+    exchange: str = "binance",
+) -> None:
     repository = SQLiteRepository(database_path)
     repository.init_schema()
-    repository.save_candles("BTCUSDT", "1h", candles)
+    repository.save_candles(
+        "BTCUSDT",
+        "1h",
+        candles,
+        exchange=exchange,
+        market_type="spot",
+    )
 
 
 def analyze_arguments(database_path: Path) -> list[str]:
@@ -86,6 +97,25 @@ def test_analyze_valid_hourly_data(
     assert "Symbol:          BTCUSDT" in output
     assert "Per-period return volatility (1h)" in output
     assert "annual" not in output.lower()
+
+
+def test_analyze_reads_only_selected_exchange(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "market_data.db"
+    candles = make_hourly_candles(72)
+    save_candles(database_path, candles[:10], exchange="binance")
+    save_candles(database_path, candles, exchange="bybit")
+    arguments = analyze_arguments(database_path)
+    arguments[1:1] = ["--exchange", "bybit"]
+
+    exit_code = main(arguments)
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Exchange:        bybit" in output
+    assert "Candles:         72" in output
 
 
 def test_analyze_rejects_missing_candle(

@@ -20,9 +20,15 @@ class FakeClient:
 class FakeCollector:
     last_instance: "FakeCollector | None" = None
 
-    def __init__(self, client: object, repository: object) -> None:
+    def __init__(
+        self,
+        client: object,
+        repository: object,
+        **configuration: object,
+    ) -> None:
         self.client = client
         self.repository = repository
+        self.configuration = configuration
         self.collect_call: dict[str, object] | None = None
         FakeCollector.last_instance = self
 
@@ -65,6 +71,7 @@ def test_collect_help(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert error.value.code == 0
     output = capsys.readouterr().out
+    assert "--exchange" in output
     assert "--symbol" in output
     assert "--database" in output
 
@@ -120,7 +127,44 @@ def test_collect_converts_utc_dates_and_initializes_database(
     assert table == ("candles",)
     output = capsys.readouterr().out
     assert "Collection completed" in output
+    assert "exchange=binance" in output
     assert "range=[2024-01-01, 2024-01-02)" in output
+
+
+def test_collect_configures_bybit_spot_backward_pagination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeBybitClient:
+        pass
+
+    monkeypatch.setattr(cli_module, "BybitSpotClient", FakeBybitClient)
+
+    exit_code = main([
+        "collect",
+        "--exchange",
+        "bybit",
+        "--symbol",
+        "BTCUSDT",
+        "--interval",
+        "1h",
+        "--start",
+        "2024-01-01",
+        "--end",
+        "2024-01-02",
+        "--database",
+        str(tmp_path / "market_data.db"),
+    ])
+
+    assert exit_code == 0
+    assert FakeCollector.last_instance is not None
+    assert isinstance(FakeCollector.last_instance.client, FakeBybitClient)
+    assert FakeCollector.last_instance.configuration == {
+        "exchange": "bybit",
+        "market_type": "spot",
+        "parser": cli_module.parse_bybit_klines,
+        "pagination_direction": "backward",
+    }
 
 
 def test_collect_uses_default_database_path(
@@ -189,6 +233,25 @@ def test_collect_rejects_non_increasing_date_range(
 
     assert error.value.code == 2
     assert "--end must be later than --start" in capsys.readouterr().err
+
+
+def test_collect_rejects_unknown_exchange() -> None:
+    with pytest.raises(SystemExit) as error:
+        main([
+            "collect",
+            "--exchange",
+            "kraken",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "1h",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-02",
+        ])
+
+    assert error.value.code == 2
 
 
 def test_collect_requires_arguments() -> None:
@@ -270,6 +333,43 @@ def test_quality_returns_zero_for_complete_range_without_http(
     assert "expected_candles=1" in output
     assert "actual_candles=1" in output
     assert "missing_candles=0" in output
+
+
+def test_quality_uses_selected_exchange(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "market_data.db"
+    repository = SQLiteRepository(database_path)
+    repository.init_schema()
+    repository.save_candles(
+        "BTCUSDT",
+        "1d",
+        [_daily_candle(1_704_067_200_000)],
+        exchange="bybit",
+        market_type="spot",
+    )
+
+    exit_code = main([
+        "quality",
+        "--exchange",
+        "bybit",
+        "--symbol",
+        "BTCUSDT",
+        "--interval",
+        "1d",
+        "--start",
+        "2024-01-01",
+        "--end",
+        "2024-01-02",
+        "--database",
+        str(database_path),
+    ])
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "exchange=bybit" in output
+    assert "actual_candles=1" in output
 
 
 def test_quality_returns_one_and_prints_missing_times_in_utc(
