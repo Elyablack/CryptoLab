@@ -113,6 +113,7 @@ def test_buy_hold_sell_executes_at_next_open_with_fees_and_slippage() -> None:
     assert len(report.completed_trades) == 1
     assert report.completed_trades[0].pnl == expected_pnl
     assert report.win_rate == Decimal("1")
+    assert report.exposure_percentage == Decimal("0.5")
     assert report.total_pnl == report.final_equity - Decimal("1000")
     assert report.total_pnl == report.realized_pnl + report.unrealized_pnl
 
@@ -130,6 +131,7 @@ def test_hold_only_preserves_initial_cash_and_portfolio_state() -> None:
     assert report.final_equity == Decimal("1000")
     assert report.total_pnl == report.realized_pnl == report.unrealized_pnl == 0
     assert report.fills == report.completed_trades == ()
+    assert report.exposure_percentage == 0
 
 
 def test_invalid_position_transitions_are_ignored_with_reasons() -> None:
@@ -217,6 +219,7 @@ def test_open_position_is_marked_without_final_sell(
     assert report.total_pnl == report.realized_pnl + report.unrealized_pnl
     assert report.unrealized_pnl * expected_sign > 0
     assert report.win_rate is None
+    assert report.exposure_percentage == Decimal("0.5")
 
 
 def test_multiple_trades_reconcile_cumulative_realized_pnl() -> None:

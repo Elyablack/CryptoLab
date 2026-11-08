@@ -23,6 +23,7 @@ CryptoLab — исследовательская платформа для сб�
 - `cryptolab analyze` — статистика и технические индикаторы;
 - `cryptolab signals` — исследовательские BUY/SELL/HOLD-сигналы.
 - `cryptolab backtest` — независимая симуляция long-only Spot-стратегий.
+- `cryptolab research` — baseline-стратегии, benchmarks и диагностика условий.
 
 Пример:
 
@@ -110,7 +111,30 @@ BUY означает предложение увеличить spot-экспоз
 закрыть её. Сигналы не являются ордерами, не открывают short-позиции и не
 передаются на биржу.
 
+## Strategy research
+
+Воспроизводимый baseline-отчёт сравнивает неизменённые Trend Following, Mean
+Reversion и Breakout с buy-and-hold и cash-only. Он также показывает exposure,
+пропущенные BUY/SELL, diagnostics каждой Trend Following сделки и частоты
+условий Mean Reversion.
+
+```bash
+cryptolab research \
+  --exchange bybit \
+  --symbol BTCUSDT \
+  --interval 1h \
+  --start 2026-10-01 \
+  --end 2026-11-01 \
+  --database data/market_data.db \
+  --fee-rate 0.001
+```
+
+Команда работает только с локальными проверенными свечами и не выполняет
+HTTP-запросы. Текущий исследовательский snapshot и ограничения описаны в
+[Strategy Research Phase 1](docs/research-phase-1.md).
+
 Подробности:
 
 - [Архитектура Market Data Collector](docs/architecture.md)
 - [ADR 0001: начальная архитектура](docs/decisions/0001-initial-architecture.md)
+- [Strategy Research Phase 1](docs/research-phase-1.md)

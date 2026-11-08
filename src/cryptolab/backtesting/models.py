@@ -133,3 +133,14 @@ class BacktestReport:
     @property
     def completed_trade_count(self) -> int:
         return len(self.completed_trades)
+
+    @property
+    def exposure_percentage(self) -> Decimal:
+        """Share of candle-close equity points with an open base position."""
+        if not self.equity_curve:
+            return Decimal("0")
+        exposed_points = sum(
+            point.base_balance > 0
+            for point in self.equity_curve
+        )
+        return Decimal(exposed_points) / Decimal(len(self.equity_curve))

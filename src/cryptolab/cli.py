@@ -21,6 +21,8 @@ from cryptolab.market_data.markets import (
     SUPPORTED_EXCHANGES,
 )
 from cryptolab.market_data.parser import parse_bybit_klines
+from cryptolab.research import StrategyResearchRunner
+from cryptolab.research.formatter import format_research_report
 from cryptolab.storage.sqlite_repository import SQLiteRepository
 from cryptolab.strategies import (
     BreakoutStrategy,
@@ -61,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "backtest":
         return _run_backtest(args, start_time, end_time, database_path)
+
+    if args.command == "research":
+        return _run_research(args, start_time, end_time, database_path)
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -394,6 +399,63 @@ def _run_backtest(
     return 0
 
 
+def _run_research(
+    args: argparse.Namespace,
+    start_time: int,
+    end_time: int,
+    database_path: Path,
+) -> int:
+    """Run unchanged baselines, benchmarks, and signal diagnostics."""
+    try:
+        if not database_path.is_file():
+            raise FileNotFoundError(
+                f"Database does not exist: {database_path}"
+            )
+
+        repository = SQLiteRepository(database_path)
+        repository.init_schema()
+        quality_report = DataQualityChecker(repository).check(
+            symbol=args.symbol,
+            interval=args.interval,
+            start_time=start_time,
+            end_time=end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        if quality_report.missing_candles:
+            raise ValueError(
+                "Cannot research incomplete historical data: "
+                f"{quality_report.missing_candles} candles are missing"
+            )
+        if quality_report.actual_candles != quality_report.expected_candles:
+            raise ValueError(
+                "Cannot research: actual candle count differs from expected count"
+            )
+
+        candles = repository.get_candles_by_range(
+            args.symbol,
+            args.interval,
+            start_time,
+            end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        report = StrategyResearchRunner(BacktestConfig(
+            fee_rate=args.fee_rate,
+        )).run(
+            args.symbol,
+            args.interval,
+            candles,
+            exchange=args.exchange,
+            market_type=SPOT_MARKET_TYPE,
+            as_of_time=end_time,
+        )
+    except Exception as error:
+        print(f"Research failed: {error}", file=sys.stderr)
+        return 1
+
+    print(format_research_report(report))
+    return 0
+
+
 def _create_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -470,6 +532,23 @@ def _create_parser() -> argparse.ArgumentParser:
         "--show-trades",
         action="store_true",
         help="show completed trades, open position, and skipped signals",
+    )
+
+    research_parser = subparsers.add_parser(
+        "research",
+        help="compare baseline strategies with simple benchmarks",
+        description=(
+            "Run reproducible baseline strategy and signal diagnostics; "
+            "no strategy parameters or exchange orders are changed"
+        ),
+    )
+    _add_common_arguments(research_parser)
+    research_parser.add_argument(
+        "--fee-rate",
+        type=_parse_decimal_rate,
+        default=Decimal("0.001"),
+        metavar="DECIMAL",
+        help="fee fraction per fill (default: 0.001 = 0.1%%)",
     )
 
     return parser
