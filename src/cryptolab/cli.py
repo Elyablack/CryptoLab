@@ -3,10 +3,13 @@
 import argparse
 import sys
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from cryptolab.analytics.analyzer import MarketAnalyzer
 from cryptolab.analytics.formatter import format_market_report
+from cryptolab.backtesting import BacktestConfig, BacktestEngine
+from cryptolab.backtesting.formatter import format_backtest_report
 from cryptolab.features.builder import FeatureBuilder
 from cryptolab.market_data.bybit_client import BybitSpotClient
 from cryptolab.market_data.client import BinanceSpotClient
@@ -55,6 +58,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "signals":
         return _run_signals(args, start_time, end_time, database_path)
+
+    if args.command == "backtest":
+        return _run_backtest(args, start_time, end_time, database_path)
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -313,6 +319,81 @@ def _run_signals(
     return 0
 
 
+def _run_backtest(
+    args: argparse.Namespace,
+    start_time: int,
+    end_time: int,
+    database_path: Path,
+) -> int:
+    """Backtest each selected strategy with an independent portfolio."""
+    try:
+        if not database_path.is_file():
+            raise FileNotFoundError(
+                f"Database does not exist: {database_path}"
+            )
+
+        repository = SQLiteRepository(database_path)
+        repository.init_schema()
+        quality_report = DataQualityChecker(repository).check(
+            symbol=args.symbol,
+            interval=args.interval,
+            start_time=start_time,
+            end_time=end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        if quality_report.missing_candles:
+            raise ValueError(
+                "Cannot backtest incomplete historical data: "
+                f"{quality_report.missing_candles} candles are missing"
+            )
+        if quality_report.actual_candles != quality_report.expected_candles:
+            raise ValueError(
+                "Cannot backtest: actual candle count differs from expected count"
+            )
+
+        candles = repository.get_candles_by_range(
+            args.symbol,
+            args.interval,
+            start_time,
+            end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        rows = FeatureBuilder().build(
+            candles,
+            interval=args.interval,
+            as_of_time=end_time,
+        )
+        engine = BacktestEngine(BacktestConfig(fee_rate=args.fee_rate))
+        reports = [
+            engine.run(
+                strategy,
+                args.symbol,
+                args.interval,
+                rows,
+                exchange=args.exchange,
+                market_type=SPOT_MARKET_TYPE,
+                as_of_time=end_time,
+            )
+            for strategy in _create_strategies(args.strategy)
+        ]
+    except Exception as error:
+        print(f"Backtest failed: {error}", file=sys.stderr)
+        return 1
+
+    print(
+        "Independent backtests: "
+        f"exchange={args.exchange}, market_type={SPOT_MARKET_TYPE}, "
+        f"symbol={args.symbol}, interval={args.interval}, "
+        f"range=[{args.start.date()}, {args.end.date()}), "
+        f"database={database_path}"
+    )
+    for report in reports:
+        print()
+        print(format_backtest_report(report))
+
+    return 0
+
+
 def _create_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -362,6 +443,28 @@ def _create_parser() -> argparse.ArgumentParser:
         "--strategy",
         choices=("all", "trend", "mean-reversion", "breakout"),
         default="all",
+    )
+
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="backtest research strategies with virtual Spot portfolios",
+        description=(
+            "Run deterministic long-only research backtests; "
+            "no exchange orders are created"
+        ),
+    )
+    _add_common_arguments(backtest_parser)
+    backtest_parser.add_argument(
+        "--strategy",
+        choices=("all", "trend", "mean-reversion", "breakout"),
+        default="all",
+    )
+    backtest_parser.add_argument(
+        "--fee-rate",
+        type=_parse_decimal_rate,
+        default=Decimal("0.001"),
+        metavar="DECIMAL",
+        help="fee fraction per fill (default: 0.001 = 0.1%%)",
     )
 
     return parser
@@ -437,6 +540,21 @@ def _format_utc_timestamp(
     )
 
     return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def _parse_decimal_rate(value: str) -> Decimal:
+    """Parse a finite decimal fraction in the range [0, 1)."""
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid decimal rate: {value!r}"
+        ) from error
+    if not result.is_finite() or not Decimal("0") <= result < 1:
+        raise argparse.ArgumentTypeError(
+            "rate must be between 0 (inclusive) and 1"
+        )
+    return result
 
 
 def _create_strategies(strategy_name: str) -> list[Strategy]:
