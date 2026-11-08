@@ -1,6 +1,7 @@
 """Sequential, look-ahead-safe strategy evaluation."""
 
 from collections.abc import Sequence
+from decimal import Decimal
 from typing import overload
 
 from cryptolab.features.models import FeatureRow
@@ -127,6 +128,40 @@ class StrategyRunner:
         previous_open_time: int | None = None
 
         for index, row in enumerate(rows):
+            timestamps = (
+                row.open_time,
+                row.close_time,
+                row.available_time,
+            )
+            if any(type(value) is not int for value in timestamps):
+                raise ValueError(
+                    f"Feature row at index {index} has non-integer timestamps"
+                )
+            if row.open_time < 0:
+                raise ValueError(
+                    f"Feature row at index {index} has negative open_time"
+                )
+
+            for field_name in ("open", "high", "low", "close"):
+                value = getattr(row, field_name)
+                if (
+                    not isinstance(value, Decimal)
+                    or not value.is_finite()
+                    or value <= 0
+                ):
+                    raise ValueError(
+                        f"Feature row at index {index} has invalid "
+                        f"{field_name} price"
+                    )
+            if row.high < max(row.open, row.close, row.low):
+                raise ValueError(
+                    f"Feature row at index {index} has invalid high price"
+                )
+            if row.low > min(row.open, row.close, row.high):
+                raise ValueError(
+                    f"Feature row at index {index} has invalid low price"
+                )
+
             if row.open_time % interval_milliseconds != 0:
                 raise ValueError(
                     f"Feature row at index {index} is not interval-aligned"

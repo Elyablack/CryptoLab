@@ -389,7 +389,7 @@ def _run_backtest(
     )
     for report in reports:
         print()
-        print(format_backtest_report(report))
+        print(format_backtest_report(report, show_trades=args.show_trades))
 
     return 0
 
@@ -465,6 +465,11 @@ def _create_parser() -> argparse.ArgumentParser:
         default=Decimal("0.001"),
         metavar="DECIMAL",
         help="fee fraction per fill (default: 0.001 = 0.1%%)",
+    )
+    backtest_parser.add_argument(
+        "--show-trades",
+        action="store_true",
+        help="show completed trades, open position, and skipped signals",
     )
 
     return parser

@@ -72,6 +72,7 @@ def test_backtest_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--exchange" in output
     assert "--strategy" in output
     assert "--fee-rate" in output
+    assert "--show-trades" in output
     assert "no exchange orders are created" in " ".join(output.split())
 
 
@@ -122,6 +123,23 @@ def test_backtest_single_strategy_uses_configured_fee(
     assert output.count("CryptoLab Backtest") == 1
     assert "Strategy:         breakout" in output
     assert "Fee per fill:     0.2000%" in output
+
+
+def test_backtest_show_trades_enables_optional_details(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "market_data.db"
+    save_bybit_candles(database_path, make_hourly_candles(72))
+    arguments = backtest_arguments(database_path)
+    arguments.extend(["--strategy", "breakout", "--show-trades"])
+
+    exit_code = main(arguments)
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert "Completed trade details" in output
+    assert "No completed trades." in output
 
 
 def test_backtest_rejects_incomplete_selected_exchange(

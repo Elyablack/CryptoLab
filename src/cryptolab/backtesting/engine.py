@@ -113,8 +113,15 @@ class BacktestEngine:
             if state.base_balance > 0
             else Decimal("0")
         )
-        if total_pnl != state.realized_pnl + unrealized_pnl:
-            raise RuntimeError("Portfolio PnL accounting invariant failed")
+        self._assert_accounting_invariants(
+            state,
+            fills,
+            trades,
+            equity_curve,
+            final_equity,
+            total_pnl,
+            unrealized_pnl,
+        )
 
         return BacktestReport(
             strategy_name=strategy.name,
@@ -164,14 +171,17 @@ class BacktestEngine:
                 )
             return self._buy(decision, execution_row, state)
 
-        if state.base_balance == 0:
-            return state, None, None, SkippedDecision(
-                decision=decision,
-                reason="SELL ignored because the portfolio is flat",
-            )
-        if open_entry_fill is None:
-            raise RuntimeError("Open position has no corresponding BUY fill")
-        return self._sell(decision, execution_row, state, open_entry_fill)
+        if decision.signal is Signal.SELL:
+            if state.base_balance == 0:
+                return state, None, None, SkippedDecision(
+                    decision=decision,
+                    reason="SELL ignored because the portfolio is flat",
+                )
+            if open_entry_fill is None:
+                raise RuntimeError("Open position has no corresponding BUY fill")
+            return self._sell(decision, execution_row, state, open_entry_fill)
+
+        raise ValueError(f"Unsupported signal value: {decision.signal!r}")
 
     def _buy(
         self,
@@ -295,3 +305,37 @@ class BacktestEngine:
     def _assert_non_negative(state: PortfolioState) -> None:
         if state.quote_balance < 0 or state.base_balance < 0:
             raise RuntimeError("Portfolio balances cannot be negative")
+
+    def _assert_accounting_invariants(
+        self,
+        state: PortfolioState,
+        fills: Sequence[SimulatedFill],
+        trades: Sequence[CompletedTrade],
+        equity_curve: Sequence[EquityPoint],
+        final_equity: Decimal,
+        total_pnl: Decimal,
+        unrealized_pnl: Decimal,
+    ) -> None:
+        """Fail loudly if deterministic portfolio accounting diverges."""
+        self._assert_non_negative(state)
+        realized_from_trades = sum(
+            (trade.pnl for trade in trades),
+            Decimal("0"),
+        )
+        if state.realized_pnl != realized_from_trades:
+            raise RuntimeError(
+                "Realized PnL does not equal completed-trade PnL"
+            )
+
+        fees_from_fills = sum(
+            (fill.fee for fill in fills),
+            Decimal("0"),
+        )
+        if state.fees_paid != fees_from_fills:
+            raise RuntimeError("Fees paid do not equal fill fees")
+        if final_equity != equity_curve[-1].equity:
+            raise RuntimeError("Final equity does not match the equity curve")
+        if total_pnl != final_equity - self._config.initial_cash:
+            raise RuntimeError("Total PnL does not match final equity")
+        if total_pnl != state.realized_pnl + unrealized_pnl:
+            raise RuntimeError("Realized and unrealized PnL do not reconcile")

@@ -1,11 +1,17 @@
 """Formatting for backtesting reports."""
 
 from collections import Counter
+from datetime import UTC, datetime
 
 from cryptolab.backtesting.models import BacktestReport
+from cryptolab.strategies.models import Signal
 
 
-def format_backtest_report(report: BacktestReport) -> str:
+def format_backtest_report(
+    report: BacktestReport,
+    *,
+    show_trades: bool = False,
+) -> str:
     """Format one independent strategy backtest with explicit units."""
     win_rate = (
         "N/A"
@@ -50,4 +56,88 @@ def format_backtest_report(report: BacktestReport) -> str:
     for reason, count in sorted(reasons.items()):
         lines.append(f"  {reason}: {count}")
 
+    if show_trades:
+        lines.extend(_format_trade_details(report))
+
     return "\n".join(lines)
+
+
+def _format_trade_details(report: BacktestReport) -> list[str]:
+    """Format completed trades, an open position, and skipped actions."""
+    base_asset = report.symbol.removesuffix("USDT")
+    lines = ["", "Completed trade details"]
+
+    if not report.completed_trades:
+        lines.append("  No completed trades.")
+    for index, trade in enumerate(report.completed_trades, start=1):
+        entry = trade.entry_fill
+        exit_fill = trade.exit_fill
+        entry_cost = entry.quote_notional + entry.fee
+        return_percentage = trade.pnl / entry_cost * 100
+        lines.extend([
+            f"Trade {index}:",
+            (
+                "  Entry signal available/execution: "
+                f"{_format_timestamp(entry.signal_available_time)} / "
+                f"{_format_timestamp(entry.execution_open_time)}"
+            ),
+            (
+                "  Exit signal available/execution:  "
+                f"{_format_timestamp(exit_fill.signal_available_time)} / "
+                f"{_format_timestamp(exit_fill.execution_open_time)}"
+            ),
+            (
+                "  Prices: entry="
+                f"{entry.execution_price} USDT, "
+                f"exit={exit_fill.execution_price} USDT"
+            ),
+            f"  {base_asset} quantity: {entry.base_quantity}",
+            (
+                "  Fees: entry="
+                f"{entry.fee} USDT, exit={exit_fill.fee} USDT"
+            ),
+            (
+                f"  Net PnL: {trade.pnl:.8f} USDT "
+                f"({return_percentage:.4f}%)"
+            ),
+        ])
+
+    if report.final_state.base_balance > 0:
+        entry = next(
+            fill for fill in reversed(report.fills)
+            if fill.side is Signal.BUY
+        )
+        mark_price = report.equity_curve[-1].close_price
+        lines.extend([
+            "",
+            "Remaining open position",
+            (
+                "  Entry signal available/execution: "
+                f"{_format_timestamp(entry.signal_available_time)} / "
+                f"{_format_timestamp(entry.execution_open_time)}"
+            ),
+            f"  Entry price: {entry.execution_price} USDT",
+            f"  Entry cost: {report.final_state.entry_cost} USDT",
+            f"  {base_asset} quantity: {report.final_state.base_balance}",
+            f"  Mark price: {mark_price} USDT (last candle close)",
+            f"  Unrealized PnL: {report.unrealized_pnl:.8f} USDT",
+        ])
+
+    if report.skipped_decisions:
+        lines.extend(["", "Skipped actionable signals"])
+        for skipped in report.skipped_decisions:
+            decision = skipped.decision
+            lines.append(
+                "  "
+                f"{decision.signal.value} at "
+                f"{_format_timestamp(decision.signal_available_time)}: "
+                f"{skipped.reason}"
+            )
+
+    return lines
+
+
+def _format_timestamp(milliseconds: int) -> str:
+    timestamp = datetime.fromtimestamp(milliseconds / 1000, tz=UTC)
+    iso_timestamp = timestamp.isoformat().replace("+00:00", "Z")
+    return f"{iso_timestamp} ({milliseconds} ms)"
