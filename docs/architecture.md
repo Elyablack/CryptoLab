@@ -1,276 +1,199 @@
-# Архитектура CryptoLab Market Data Collector
+# CryptoLab v1.0 Architecture
 
-## 1. Назначение и границы первой версии
+## Scope
 
-Market Data Collector — первый компонент исследовательской платформы
-CryptoLab. Он получает исторические часовые OHLCV-свечи для спотовых пар
-`BTC/USDT` и `ETH/USDT`, проверяет их и сохраняет локально для последующего
-анализа.
+CryptoLab is one local Python CLI application for historical public Spot market
+research. It contains no authenticated API, real order execution, portfolio
+service, scheduler, web service, queue, or background worker.
 
-Первая версия:
+Supported sources are Binance Spot and Bybit V5 Spot. Supported intervals are
+`1m`, `5m`, `15m`, `1h`, `4h`, and `1d`. All ranges are UTC and half-open.
 
-- использует только публичные рыночные данные Binance Spot;
-- не требует API-ключей;
-- не обращается к приватным или торговым API;
-- не выставляет и не моделирует торговые заявки;
-- работает как одно локальное Python-приложение;
-- сохраняет данные в SQLite.
-
-Границы временного диапазона задаются в UTC с семантикой `[from, to)`: начало
-включается, окончание не включается. В хранилище попадают только полностью
-закрытые свечи.
-
-## 2. Общая архитектура
+## Component map
 
 ```text
-CLI / запуск сбора
-        │
-        ▼
-Collector — диапазон, пагинация и управление процессом
-        │
-        ▼
-BinanceSpotClient — публичные HTTP GET-запросы
-        │
-        ▼
-Parser → Candle
-        │
-        ▼
-Validator — проверка свечей и последовательности
-        │
-        ▼
-SQLiteRepository — транзакционный UPSERT
-        │
-        ▼
-Проверка полноты диапазона и отчёт запуска
+CLI
+├── collect ── public client ── parser ── validator ── collector ── SQLite
+├── quality ─────────────────── DataQualityChecker ──────────────── SQLite
+├── analyze ── quality ── MarketAnalyzer ── indicators/returns
+├── signals ── quality ── FeatureBuilder ── StrategyRunner
+├── backtest ─ quality ── FeatureBuilder ── BacktestEngine/formatter
+└── research ─ quality ── StrategyResearchRunner
+                         ├── three independent BacktestEngine runs
+                         ├── buy-and-hold and cash-only
+                         └── signal/trade diagnostics
 ```
 
-### 2.1. Компоненты
+### Market data
 
-#### CLI
+- `client.py`: Binance public klines.
+- `bybit_client.py`: Bybit V5 public Spot klines.
+- `http.py`: shared retry and HTTP failure classification.
+- `parser.py`: exchange payloads to immutable `Candle` values.
+- `validator.py`: numeric, OHLCV, sequence, timestamp, and closed checks.
+- `collector.py`: pagination, unfinished-candle exclusion, persistence, and
+  final coverage verification.
+- `data_quality.py`: exact persisted-range validation.
+- `intervals.py` and `markets.py`: supported domain identities.
 
-- принимает начальную и конечную даты в UTC;
-- запускает сбор для обеих торговых пар;
-- выводит итоговую статистику;
-- возвращает ненулевой код завершения при ошибках или неполном наборе данных.
+### Storage
 
-#### Collector
+`SQLiteRepository` owns schema creation, migration, source-isolated reads, and
+atomic page writes. It uses only parameterized SQL and opens short-lived
+connections per operation.
 
-- управляет сбором для символа и интервала;
-- разбивает диапазон на страницы с учётом лимита API;
-- перемещает курсор по времени открытия последней полученной свечи;
-- не допускает сохранения незакрытой текущей свечи;
-- передаёт каждую страницу на проверку и сохранение.
+### Analytics and features
 
-#### BinanceSpotClient
+The Analytics Layer calculates simple/log returns, nonannualized sample
+volatility, close-to-close maximum drawdown, SMA, EMA, Wilder RSI/ATR, and RVOL.
+`FeatureBuilder` aligns all values to candles and preserves warm-up `None`
+values. A feature becomes available at `close_time + 1`.
 
-- обращается к market-data endpoint Binance Spot;
-- получает свечи через `GET /api/v3/klines`;
-- задаёт явные таймауты соединения и чтения;
-- классифицирует HTTP- и сетевые ошибки;
-- обрабатывает ограничения частоты запросов.
+### Strategies
 
-Клиент имеет узкий внутренний интерфейс, чтобы тесты Collector могли работать
-без сети. Полноценная система плагинов для бирж в первой версии не нужна.
+Strategies implement one read-only interface and receive history views ending
+at the current row. Decisions include the signal candle, availability time,
+reference price, explanation, and immutable diagnostics. Strategy code has no
+access to exchange clients or portfolio state.
 
-#### Parser и модель Candle
+### Backtesting
 
-- преобразуют массив Binance в именованную доменную модель;
-- преобразуют цены и объёмы в `Decimal`;
-- сохраняют временные метки как Unix time в миллисекундах;
-- не допускают молчаливого принятия неожиданной структуры ответа.
+`BacktestEngine` evaluates one strategy and one independent virtual long-only
+portfolio. It executes signals at the next open, applies Decimal fees and
+slippage, retains an equity curve, and asserts accounting invariants. Optional
+trailing-stop fills share the normal SELL settlement path but carry separate
+audit metadata rather than fabricated strategy timestamps.
 
-#### Validator
+### Research
 
-- проверяет корректность каждой свечи;
-- проверяет сортировку, уникальность и временной шаг;
-- после загрузки сверяет хранилище с ожидаемой часовой сеткой диапазона;
-- сообщает о пропусках, не подменяя их нулевыми свечами.
+`StrategyResearchRunner` runs unchanged strategies, deterministic benchmarks,
+and diagnostic condition counts. Generated reports and local databases are
+runtime artifacts rather than source fixtures.
 
-#### SQLiteRepository
+## Collection state machine
 
-- создаёт и использует локальную SQLite-базу;
-- сохраняет одну страницу в одной транзакции;
-- обеспечивает уникальность свечи составным первичным ключом;
-- выполняет UPSERT при повторном получении той же свечи;
-- регистрирует результаты каждого запуска.
+1. Validate exchange, interval, range ordering, and range alignment.
+2. Request a page using the exchange-specific pagination direction.
+3. Retry only transient transport, timeout, rate-limit, and 5xx failures.
+4. Parse the full payload and reject invalid structures.
+5. Validate each candle and its interval timing.
+6. Exclude candles whose inclusive `close_time` has not passed.
+7. Atomically classify candidates as inserted, identical, or conflicting.
+8. Advance by observed candle time and reject non-progressing/out-of-range
+   responses.
+9. Validate the complete requested grid from SQLite.
+10. Return success only for exact, valid persisted coverage without conflicts.
 
-## 3. Модель хранения
+An empty page before reaching the requested boundary is recorded explicitly.
+A range before market listing is legitimate no-data, but it remains incomplete
+and returns nonzero. CryptoLab has no authoritative listing-date registry and
+does not guess or fill the missing prefix.
 
-### 3.1. Таблица `candles`
+## HTTP failure policy
 
-| Поле | Назначение |
+The default policy permits three total attempts. Delay is capped exponential
+backoff plus additive jitter. Server `Retry-After` and Bybit reset timestamps
+are lower bounds.
+
+| Condition | Behavior |
 |---|---|
-| `exchange` | Источник данных, например `binance` |
-| `symbol` | Символ биржи: `BTCUSDT` или `ETHUSDT` |
-| `interval` | Интервал, первоначально `1h` |
-| `open_time_ms` | Время открытия в Unix milliseconds |
-| `close_time_ms` | Время закрытия в Unix milliseconds |
-| `open` | Цена открытия |
-| `high` | Максимальная цена |
-| `low` | Минимальная цена |
-| `close` | Цена закрытия |
-| `volume` | Объём в базовом активе |
-| `quote_volume` | Объём в котируемом активе |
-| `trade_count` | Число сделок в свече |
-| `first_collected_at` | Время первого сохранения |
-| `last_collected_at` | Время последнего подтверждения или обновления |
+| Timeout/transport failure | Retry, then `RetryExhaustedError` |
+| HTTP 429 | Retry respecting server delay |
+| HTTP 5xx | Retry |
+| Binance HTTP 418 | Immediate stop |
+| Other HTTP 4xx | Immediate `HTTPStatusError` |
+| Bybit `retCode=10006` | Retry as rate limit |
+| Invalid JSON/payload | Immediate data error |
 
-Составной первичный ключ:
+No URL query contains credentials because all supported endpoints are public.
 
-```text
-(exchange, symbol, interval, open_time_ms)
-```
+## Collection result semantics
 
-Цены и объёмы сохраняются в исходном десятичном представлении. В приложении
-они обрабатываются как `Decimal`, что исключает внесение ошибок двоичной
-арифметики с плавающей точкой на этапе сбора.
+`CollectionResult` contains exchange/market/range identity and exact counters:
 
-### 3.2. Таблица `collection_runs`
+- expected interval slots;
+- HTTP candles received;
+- new, identical, and conflicting persistence classifications;
+- missing, invalid, and unexpected final rows;
+- excluded unfinished candles and empty page count;
+- bounded timestamp previews and a human-readable failure reason.
 
-Таблица хранит:
+The model is immutable. `succeeded` is true only when no failure or integrity
+issue remains.
 
-- идентификатор и время запуска;
-- запрошенный диапазон, символ и интервал;
-- статус выполнения;
-- количество полученных, добавленных и обновлённых свечей;
-- количество найденных пропусков и ошибок качества;
-- текст последней ошибки, если запуск не завершился успешно.
+## Data integrity
 
-## 4. Движение данных
+`Candle` holds Decimal prices/volumes, millisecond timestamps, and optional
+exchange-specific fields. Validation rejects nonfinite values, bad OHLC
+relationships, negative volumes/trades, unaligned opens, incorrect closes,
+future/unclosed candles, missing slots, extras, and duplicates.
+
+The database primary key is:
 
 ```text
-Пара + диапазон UTC
-        │
-        ├─► проверка доступности пары через exchangeInfo
-        │
-        ├─► определение последней закрытой часовой свечи
-        │
-        └─► последовательные запросы /api/v3/klines
-                    │
-                    ▼
-               JSON Binance
-                    │
-                    ▼
-         разбор timestamp и Decimal
-                    │
-                    ▼
-           проверка каждой страницы
-                    │
-                    ▼
-        транзакционный UPSERT в SQLite
-                    │
-                    ▼
-       проверка полной часовой сетки в БД
-                    │
-                    ▼
-              итоговый отчёт
+(exchange, market_type, symbol, interval, open_time)
 ```
 
-Проверка полноты выполняется по данным в базе после сбора. Поэтому она
-учитывает страницы, сохранённые предыдущим прерванным запуском.
+Historical conflict policy is detect-and-retain. An existing row never changes
+implicitly. Conflicts make the collection unsuccessful and must be reviewed
+after a backup. This preserves reproducible research inputs.
 
-## 5. Повторный запуск и отказоустойчивость
+## Schema lifecycle
 
-- Повторный запуск запрашивает тот же заданный диапазон.
-- Составной первичный ключ исключает физические дубли.
-- UPSERT оставляет состояние неизменным для совпадающих данных.
-- Если биржа исправила историческую свечу, запись обновляется, а изменение
-  отражается в отчёте запуска.
-- Успешно проверенные страницы фиксируются отдельными транзакциями.
-- После сбоя уже сохранённые страницы остаются в базе; повторный запуск
-  достраивает и повторно проверяет весь диапазон.
+Schema v2 is stored in `PRAGMA user_version`. A new database is created at v2.
+An existing v2-shaped database with version zero is verified and adopted.
+Unknown newer or partial schemas fail safely.
 
-Для двух пар и часового интервала такой подход достаточно прост и не создаёт
-существенной нагрузки. Оптимизация инкрементальной загрузки может быть добавлена
-после появления измеримой необходимости.
+Legacy Binance-only migration runs under `BEGIN IMMEDIATE`:
 
-## 6. Обработка ошибок API
+1. rename the original table to `candles_legacy_v1_backup`;
+2. create the source-aware v2 table;
+3. copy every row as `binance/spot`;
+4. compare source and destination row counts;
+5. set user version and commit.
 
-- Ошибки соединения, таймауты и временные `5xx` повторяются ограниченное число
-  раз с exponential backoff и jitter.
-- При `429 Too Many Requests` учитывается заголовок `Retry-After`.
-- При `418` сбор прекращается: продолжение запросов может продлить блокировку IP.
-- Остальные `4xx` считаются ошибкой запроса и автоматически не повторяются.
-- Число повторов всегда ограничено; бесконечные циклы запрещены.
-- Пустой или структурно неожиданный ответ не интерпретируется как успешный
-  пустой диапазон.
+The backup table is retained. SQLite transaction rollback restores the original
+state if any migration step fails.
 
-## 7. Проверки качества данных
+## Determinism and look-ahead safety
 
-### Проверки одной свечи
+- Candle and decision models are immutable.
+- Decimal is used for stored values and portfolio accounting.
+- Feature and strategy evaluation accept explicit `as_of_time`.
+- Indicators use current and past candles only.
+- Breakout thresholds exclude the current candle.
+- Strategy histories are read-only prefix views.
+- Decisions are available after close and execute at the next open.
+- Trailing high updates only after the current candle stop check.
 
-- все обязательные поля присутствуют и преобразуются в ожидаемые типы;
-- `open`, `high`, `low` и `close` положительны;
-- `low <= open <= high`;
-- `low <= close <= high`;
-- `high >= low`;
-- объёмы и число сделок неотрицательны;
-- `open_time` выровнен по началу часа в UTC;
-- `close_time` соответствует часовому интервалу;
-- свеча полностью закрыта.
+## Operational model
 
-### Проверки набора
+CryptoLab is supported as a local Python package and CLI. SQLite is appropriate
+for one local writer; concurrent collectors are unsupported. Human-readable
+stdout is stable for research use, while diagnostics use standard `logging` on
+stderr. `--verbose` enables tracebacks at command boundaries.
 
-- свечи отсортированы по `open_time`;
-- внутри страницы нет повторяющихся времён открытия;
-- последовательные свечи отличаются ровно на один час;
-- в базе присутствуют все ожидаемые точки часовой сетки `[from, to)`;
-- для каждой пары и часа существует не более одной записи.
+There is intentionally no Docker or service deployment requirement for v1.0.
+GitHub Actions verifies Python 3.12/3.13, tests, package installation, CLI,
+static checks, dependency audit, and secret scanning.
 
-Пропуск данных считается явной проблемой качества. Он не заполняется
-синтетической свечой и требует повторного сбора или отдельного анализа причины.
+## Security boundaries
 
-## 8. Зависимости
+- public endpoints only;
+- no private keys, authentication, account data, or orders;
+- parameterized SQLite statements;
+- TLS verification provided by HTTPX defaults;
+- constrained dependencies and automated audit;
+- runtime `.env`, database, and report artifacts excluded from source.
 
-### Runtime
+Adding live execution requires a separate architecture and security project; it
+is not an extension point of the current Strategy Engine.
 
-- `httpx` — HTTP-клиент, таймауты, заголовки и тестовый транспорт;
-- `tenacity` — ограниченные повторные попытки с backoff и jitter.
+## Known limitations
 
-Из стандартной библиотеки используются `sqlite3`, `decimal`, `datetime`,
-`dataclasses`, `argparse` и `logging`.
-
-### Разработка
-
-- `pytest` — модульные и интеграционные тесты;
-- `pytest-cov` — контроль покрытия критических ветвей;
-- `ruff` — форматирование и статические проверки;
-- `mypy` — проверка типов.
-
-В первой версии не нужны `pandas`, `SQLAlchemy`, `ccxt`, брокеры сообщений,
-Redis и отдельный сервер базы данных. Версии зависимостей будут зафиксированы
-на этапе реализации.
-
-## 9. План реализации
-
-1. Описать модель `Candle` и правила работы со временем UTC.
-2. Реализовать SQLite-схему, уникальный ключ и тесты UPSERT.
-3. Реализовать парсер на сохранённом примере ответа без сетевого доступа.
-4. Реализовать валидацию свечи и временной последовательности.
-5. Реализовать HTTP-клиент с таймаутами и классификацией ошибок.
-6. Добавить пагинацию одного символа на небольшом диапазоне.
-7. Добавить сбор `BTCUSDT` и `ETHUSDT`.
-8. Проверить повторный и прерванный запуск.
-9. Протестировать `429`, `5xx`, таймауты и некорректные ответы.
-10. Добавить CLI, итоговый отчёт и инструкции по запуску.
-
-Каждая итерация должна завершаться работающими автоматическими тестами.
-
-## 10. Критерии приёмки первой версии
-
-- Собираются часовые свечи `BTCUSDT` и `ETHUSDT` за заданный UTC-диапазон.
-- Используется только публичный Binance Spot API без API-ключей.
-- В базе сохраняются только закрытые свечи.
-- Для диапазона из `N` полных часов при отсутствии биржевых пропусков хранится
-  ровно `2 × N` свечей.
-- Повторный запуск не увеличивает количество записей.
-- После искусственно прерванного запуска повторный запуск завершает диапазон
-  без дублей.
-- Обнаруживаются пропущенный час, дубликат, неверный timestamp и нарушение
-  OHLC-инвариантов.
-- Исходная десятичная точность цен и объёмов сохраняется.
-- Повторы сетевых запросов ограничены, а `429` учитывает `Retry-After`.
-- Ошибки запроса и неправильная структура ответа не маскируются.
-- Каждый запуск оставляет понятный отчёт о результате.
-- Модульные тесты не требуют доступа к интернету.
-
+- no automatic exchange listing-date discovery;
+- no historical conflict auto-resolution;
+- no multi-writer SQLite coordination;
+- no scheduler or monitoring service;
+- no machine-readable CLI output yet;
+- backtests do not model order books or exchange quantity filters.

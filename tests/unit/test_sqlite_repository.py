@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from cryptolab.market_data.models import Candle
-from cryptolab.storage.sqlite_repository import SQLiteRepository
+from cryptolab.storage.sqlite_repository import (
+    LEGACY_BACKUP_TABLE,
+    SCHEMA_VERSION,
+    SQLiteRepository,
+)
 
 
 FIRST_CANDLE = Candle(
@@ -55,6 +59,7 @@ def test_init_schema_creates_candles_table(database_path: Path) -> None:
         ).fetchone()
 
     assert row == ("candles",)
+    assert repository.get_schema_version() == SCHEMA_VERSION
 
 
 def test_save_and_get_candles_returns_them_ordered(
@@ -123,10 +128,12 @@ def test_get_latest_open_time_returns_maximum_value(
 def test_saving_same_candle_twice_does_not_create_duplicate(
     repository: SQLiteRepository,
 ) -> None:
-    repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
-    repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
+    first = repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
+    second = repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
 
     assert repository.get_candles("BTCUSDT", "1h") == [FIRST_CANDLE]
+    assert first.inserted == 1
+    assert second.existing == 1
 
 
 def test_conflict_does_not_overwrite_existing_candle(
@@ -135,9 +142,12 @@ def test_conflict_does_not_overwrite_existing_candle(
     changed_candle = replace(FIRST_CANDLE, close=Decimal("119.0000"))
     repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
 
-    repository.save_candles("BTCUSDT", "1h", [changed_candle])
+    result = repository.save_candles("BTCUSDT", "1h", [changed_candle])
 
     assert repository.get_candles("BTCUSDT", "1h") == [FIRST_CANDLE]
+    assert result.conflicting == 1
+    assert result.conflicts[0].existing == FIRST_CANDLE
+    assert result.conflicts[0].incoming == changed_candle
 
 
 def test_save_candles_rolls_back_entire_batch_on_error(
@@ -217,12 +227,15 @@ def test_init_schema_migrates_legacy_rows_to_binance_spot(
             for row in connection.execute("PRAGMA table_info(candles)")
             if row[5]
         ]
-        legacy_table = connection.execute(
+        backup_table = connection.execute(
             """
-            SELECT name FROM sqlite_master
-            WHERE type = 'table' AND name = 'candles_legacy_binance_spot'
-            """
+            SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?
+            """,
+            (LEGACY_BACKUP_TABLE,),
         ).fetchone()
+        backup_count = connection.execute(
+            f"SELECT COUNT(*) FROM {LEGACY_BACKUP_TABLE}"
+        ).fetchone()[0]
 
     assert identity == ("binance", "spot")
     assert primary_key == [
@@ -232,7 +245,9 @@ def test_init_schema_migrates_legacy_rows_to_binance_spot(
         "interval",
         "open_time",
     ]
-    assert legacy_table is None
+    assert backup_table == (LEGACY_BACKUP_TABLE,)
+    assert backup_count == 1
+    assert repository.get_schema_version() == SCHEMA_VERSION
 
 
 def test_same_candle_key_is_isolated_by_exchange(
@@ -274,3 +289,31 @@ def test_same_candle_key_is_isolated_by_exchange(
         ("binance", 25, "6.7000"),
         ("bybit", None, None),
     ]
+
+
+def test_current_unversioned_schema_is_adopted_without_data_loss(
+    repository: SQLiteRepository,
+    database_path: Path,
+) -> None:
+    repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("PRAGMA user_version = 0")
+
+    repository.init_schema()
+
+    assert repository.get_schema_version() == SCHEMA_VERSION
+    assert repository.get_candles("BTCUSDT", "1h") == [FIRST_CANDLE]
+
+
+def test_newer_schema_version_fails_without_changing_rows(
+    repository: SQLiteRepository,
+    database_path: Path,
+) -> None:
+    repository.save_candles("BTCUSDT", "1h", [FIRST_CANDLE])
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+
+    with pytest.raises(RuntimeError, match="newer than supported"):
+        repository.init_schema()
+
+    assert repository.get_candles("BTCUSDT", "1h") == [FIRST_CANDLE]

@@ -230,3 +230,72 @@ def test_check_isolates_identical_markets_by_exchange(
     assert bybit_report.actual_candles == 0
     assert bybit_report.missing_candles == 1
     assert bybit_report.exchange == "bybit"
+
+
+def test_check_rejects_invalid_ohlc_even_when_coverage_is_complete(
+    repository: SQLiteRepository,
+) -> None:
+    invalid = make_candle(0, 60_000)
+    invalid = Candle(**{
+        **invalid.__dict__,
+        "high": Decimal("99"),
+    })
+    repository.save_candles("BTCUSDT", "1m", [invalid])
+
+    report = DataQualityChecker(repository).check(
+        "BTCUSDT", "1m", 0, 60_000, as_of_time=120_000
+    )
+
+    assert report.missing_candles == 0
+    assert report.invalid_candles == 1
+    assert not report.is_valid
+    assert "invalid high price" not in report.invalid_reasons[0]
+    assert "high price cannot be less" in report.invalid_reasons[0]
+
+
+def test_check_detects_misaligned_unexpected_timestamp(
+    repository: SQLiteRepository,
+) -> None:
+    repository.save_candles("BTCUSDT", "1m", [make_candle(1, 60_000)])
+
+    report = DataQualityChecker(repository).check(
+        "BTCUSDT", "1m", 0, 60_000, as_of_time=120_000
+    )
+
+    assert report.missing_candles == 1
+    assert report.unexpected_candles == 1
+    assert report.unexpected_open_times == (1,)
+    assert report.invalid_candles == 1
+    assert not report.is_valid
+
+
+def test_check_detects_incorrect_close_time(
+    repository: SQLiteRepository,
+) -> None:
+    candle = make_candle(0, 60_000)
+    candle = Candle(**{**candle.__dict__, "close_time": 60_000})
+    repository.save_candles("BTCUSDT", "1m", [candle])
+
+    report = DataQualityChecker(repository).check(
+        "BTCUSDT", "1m", 0, 60_000, as_of_time=120_000
+    )
+
+    assert report.invalid_candles == 1
+    assert "close_time does not match" in report.invalid_reasons[0]
+    assert not report.is_valid
+
+
+def test_check_detects_duplicate_timestamps_from_repository() -> None:
+    candle = make_candle(0, 60_000)
+
+    class DuplicateRepository:
+        def get_candles_by_range(self, *args, **kwargs) -> list[Candle]:
+            return [candle, candle]
+
+    report = DataQualityChecker(DuplicateRepository()).check(  # type: ignore[arg-type]
+        "BTCUSDT", "1m", 0, 60_000, as_of_time=120_000
+    )
+
+    assert report.duplicate_candles == 1
+    assert report.duplicate_open_times == (0,)
+    assert not report.is_valid

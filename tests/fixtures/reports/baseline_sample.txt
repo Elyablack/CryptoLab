@@ -1,0 +1,20 @@
+trend_following: return=9.00%, final=1090.00 USDT, realized=90.00, unrealized=0.00, max_dd=-2.00%, trades=1, win_rate=100.00%, fees=2.00, exposure=50.00%, skipped_buy=0, skipped_sell=0, open_position=yes
+
+Trend Following executed trades
+Trade 17:
+  Entry times: signal_candle=2025-01-01T00:00:00Z, available=2025-01-01T01:00:00Z, executed=2025-01-01T01:00:00Z
+  Entry execution: price=100.00 USDT, fee=1.00 USDT
+  Exit times: signal_candle=2025-01-01T04:00:00Z, available=2025-01-01T05:00:00Z, executed=2025-01-01T05:00:00Z
+  Exit execution: price=110.00 USDT, fee=1.00 USDT
+  Result: pnl=90.00 USDT, return=9.0000%, holding=4h
+  Quantity: 9.00 BTC
+
+Trend Following remaining open position:
+  Entry times: signal_candle=2025-01-02T00:00:00Z, available=2025-01-02T01:00:00Z, executed=2025-01-02T01:00:00Z
+  Entry execution: price=120.00 USDT, fee=1.00 USDT
+  Entry cost: 900.00 USDT
+  Quantity: 7.50 BTC
+  Mark price: 118.00 USDT (last close)
+  Unrealized PnL: -15.00 USDT
+
+Mean Reversion BUY-condition frequency

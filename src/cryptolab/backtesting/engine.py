@@ -1,6 +1,7 @@
 """Deterministic long-only Spot backtesting engine."""
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import Decimal
 
 from cryptolab.backtesting.models import (
@@ -8,9 +9,12 @@ from cryptolab.backtesting.models import (
     BacktestReport,
     CompletedTrade,
     EquityPoint,
+    Fill,
     PortfolioState,
     SimulatedFill,
     SkippedDecision,
+    TrailingStopFill,
+    TrailingStopTriggerKind,
 )
 from cryptolab.features.models import FeatureRow
 from cryptolab.market_data.markets import (
@@ -21,6 +25,13 @@ from cryptolab.market_data.markets import (
 from cryptolab.strategies.base import Strategy
 from cryptolab.strategies.models import Signal, StrategyDecision
 from cryptolab.strategies.runner import StrategyRunner
+
+
+@dataclass(frozen=True)
+class _TrailingStopState:
+    """High watermark known before the candle currently being processed."""
+
+    high_watermark: Decimal
 
 
 class BacktestEngine:
@@ -70,11 +81,12 @@ class BacktestEngine:
             realized_pnl=Decimal("0"),
             fees_paid=Decimal("0"),
         )
-        fills: list[SimulatedFill] = []
+        fills: list[Fill] = []
         trades: list[CompletedTrade] = []
         skipped: list[SkippedDecision] = []
         equity_curve: list[EquityPoint] = []
         open_entry_fill: SimulatedFill | None = None
+        trailing_stop_state: _TrailingStopState | None = None
 
         for index, row in enumerate(eligible_rows):
             if index > 0:
@@ -88,13 +100,50 @@ class BacktestEngine:
                 if fill is not None:
                     fills.append(fill)
                     if fill.side is Signal.BUY:
+                        if not isinstance(fill, SimulatedFill):
+                            raise RuntimeError(
+                                "A trailing-stop fill cannot open a position"
+                            )
                         open_entry_fill = fill
+                        if self._config.trailing_stop_rate is not None:
+                            trailing_stop_state = _TrailingStopState(
+                                high_watermark=fill.execution_price,
+                            )
                     else:
                         open_entry_fill = None
+                        trailing_stop_state = None
                 if trade is not None:
                     trades.append(trade)
                 if skip is not None:
                     skipped.append(skip)
+
+            if (
+                self._config.trailing_stop_rate is not None
+                and state.base_balance > 0
+            ):
+                if open_entry_fill is None or trailing_stop_state is None:
+                    raise RuntimeError(
+                        "Open position has no trailing-stop state"
+                    )
+                stop_result = self._execute_trailing_stop(
+                    row,
+                    state,
+                    open_entry_fill,
+                    trailing_stop_state,
+                )
+                if stop_result is not None:
+                    state, stop_fill, trade = stop_result
+                    fills.append(stop_fill)
+                    trades.append(trade)
+                    open_entry_fill = None
+                    trailing_stop_state = None
+                else:
+                    trailing_stop_state = _TrailingStopState(
+                        high_watermark=max(
+                            trailing_stop_state.high_watermark,
+                            row.high,
+                        ),
+                    )
 
             equity_curve.append(self._mark_equity(row, state))
 
@@ -223,7 +272,75 @@ class BacktestEngine:
         state: PortfolioState,
         entry_fill: SimulatedFill,
     ) -> tuple[PortfolioState, SimulatedFill, CompletedTrade, None]:
-        execution_price = row.open * (
+        new_state, fill, trade = self._settle_sell(
+            row=row,
+            state=state,
+            entry_fill=entry_fill,
+            market_reference_price=row.open,
+            decision=decision,
+        )
+        if not isinstance(fill, SimulatedFill):
+            raise RuntimeError("Strategy SELL produced a non-strategy fill")
+        return new_state, fill, trade, None
+
+    def _execute_trailing_stop(
+        self,
+        row: FeatureRow,
+        state: PortfolioState,
+        entry_fill: SimulatedFill,
+        trailing_state: _TrailingStopState,
+    ) -> tuple[PortfolioState, TrailingStopFill, CompletedTrade] | None:
+        rate = self._config.trailing_stop_rate
+        if rate is None:
+            return None
+
+        active_stop_price = trailing_state.high_watermark * (
+            Decimal("1") - rate
+        )
+        if row.open <= active_stop_price:
+            trigger_kind = TrailingStopTriggerKind.GAP_OPEN
+            market_reference_price = row.open
+        elif row.low <= active_stop_price:
+            trigger_kind = TrailingStopTriggerKind.INTRABAR
+            market_reference_price = active_stop_price
+        else:
+            return None
+
+        new_state, fill, trade = self._settle_sell(
+            row=row,
+            state=state,
+            entry_fill=entry_fill,
+            market_reference_price=market_reference_price,
+            trailing_state=trailing_state,
+            active_stop_price=active_stop_price,
+            trigger_kind=trigger_kind,
+        )
+        if not isinstance(fill, TrailingStopFill):
+            raise RuntimeError("Trailing stop produced a strategy fill")
+        return new_state, fill, trade
+
+    def _settle_sell(
+        self,
+        *,
+        row: FeatureRow,
+        state: PortfolioState,
+        entry_fill: SimulatedFill,
+        market_reference_price: Decimal,
+        decision: StrategyDecision | None = None,
+        trailing_state: _TrailingStopState | None = None,
+        active_stop_price: Decimal | None = None,
+        trigger_kind: TrailingStopTriggerKind | None = None,
+    ) -> tuple[PortfolioState, Fill, CompletedTrade]:
+        """Apply the single all-out SELL accounting path."""
+        is_strategy_exit = decision is not None
+        is_stop_exit = all(
+            value is not None
+            for value in (trailing_state, active_stop_price, trigger_kind)
+        )
+        if is_strategy_exit == is_stop_exit:
+            raise RuntimeError("SELL must have exactly one execution source")
+
+        execution_price = market_reference_price * (
             Decimal("1") - self._config.slippage_rate
         )
         base_quantity = state.base_balance
@@ -239,18 +356,39 @@ class BacktestEngine:
             realized_pnl=quote_balance - self._config.initial_cash,
             fees_paid=state.fees_paid + fee,
         )
-        fill = self._fill(
-            decision,
-            row,
-            execution_price,
-            base_quantity,
-            quote_notional,
-            fee,
-            new_state,
-        )
+        if decision is not None:
+            fill: Fill = self._fill(
+                decision,
+                row,
+                execution_price,
+                base_quantity,
+                quote_notional,
+                fee,
+                new_state,
+            )
+        else:
+            if (
+                trailing_state is None
+                or active_stop_price is None
+                or trigger_kind is None
+            ):
+                raise RuntimeError("Trailing-stop metadata is incomplete")
+            fill = TrailingStopFill(
+                trigger_kind=trigger_kind,
+                trigger_candle_open_time=row.open_time,
+                high_watermark=trailing_state.high_watermark,
+                active_stop_price=active_stop_price,
+                market_reference_price=market_reference_price,
+                execution_price=execution_price,
+                base_quantity=base_quantity,
+                quote_notional=quote_notional,
+                fee=fee,
+                quote_balance_after=new_state.quote_balance,
+                base_balance_after=new_state.base_balance,
+            )
         trade = CompletedTrade(entry_fill=entry_fill, exit_fill=fill, pnl=trade_pnl)
         self._assert_non_negative(new_state)
-        return new_state, fill, trade, None
+        return new_state, fill, trade
 
     @staticmethod
     def _fill(
@@ -309,7 +447,7 @@ class BacktestEngine:
     def _assert_accounting_invariants(
         self,
         state: PortfolioState,
-        fills: Sequence[SimulatedFill],
+        fills: Sequence[Fill],
         trades: Sequence[CompletedTrade],
         equity_curve: Sequence[EquityPoint],
         final_equity: Decimal,

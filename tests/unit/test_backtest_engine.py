@@ -4,7 +4,13 @@ from decimal import Decimal
 
 import pytest
 
-from cryptolab.backtesting import BacktestConfig, BacktestEngine
+from cryptolab.backtesting import (
+    BacktestConfig,
+    BacktestEngine,
+    SimulatedFill,
+    TrailingStopFill,
+    TrailingStopTriggerKind,
+)
 from cryptolab.backtesting.formatter import format_backtest_report
 from cryptolab.features.models import FeatureRow
 from cryptolab.strategies.base import make_decision
@@ -339,6 +345,277 @@ def test_losing_completed_trade_has_zero_win_rate() -> None:
     assert report.realized_pnl == report.total_pnl
 
 
+def test_disabled_trailing_stop_is_exactly_baseline_equivalent() -> None:
+    rows = make_rows(["100", "110", "120", "130"])
+    strategy = ScriptedStrategy([
+        Signal.BUY,
+        Signal.HOLD,
+        Signal.SELL,
+        Signal.HOLD,
+    ])
+
+    baseline = BacktestEngine().run(strategy, "BTCUSDT", "1h", rows)
+    explicitly_disabled = BacktestEngine(BacktestConfig(
+        trailing_stop_rate=None,
+    )).run(strategy, "BTCUSDT", "1h", rows)
+
+    assert explicitly_disabled == baseline
+    assert format_backtest_report(explicitly_disabled) == format_backtest_report(
+        baseline
+    )
+    assert "Trailing stop:" not in format_backtest_report(baseline)
+
+
+def test_trailing_stop_is_active_on_entry_candle_without_using_its_high() -> None:
+    rows = make_rows(["100", "100"], closes=["100", "95"])
+    rows[1] = replace(
+        rows[1],
+        high=Decimal("105"),
+        low=Decimal("89"),
+    )
+    strategy = ScriptedStrategy([Signal.BUY, Signal.HOLD])
+    config = BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    assert len(report.fills) == 2
+    assert isinstance(report.fills[0], SimulatedFill)
+    stop_fill = report.fills[1]
+    assert isinstance(stop_fill, TrailingStopFill)
+    assert stop_fill.trigger_kind is TrailingStopTriggerKind.INTRABAR
+    assert stop_fill.trigger_candle_open_time == rows[1].open_time
+    assert stop_fill.high_watermark == Decimal("100")
+    assert stop_fill.active_stop_price == Decimal("90.00")
+    assert stop_fill.market_reference_price == Decimal("90.00")
+    assert stop_fill.execution_price == Decimal("90.00")
+    assert not hasattr(stop_fill, "signal_open_time")
+    assert report.final_equity == Decimal("900.0")
+    assert report.completed_trades[0].pnl == Decimal("-100.0")
+    assert report.exposure_percentage == 0
+
+
+def test_current_high_updates_stop_only_for_the_next_candle() -> None:
+    rows = make_rows(
+        ["100", "100", "110"],
+        closes=["100", "115", "109"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("120"), low=Decimal("95"))
+    rows[2] = replace(rows[2], high=Decimal("112"), low=Decimal("108"))
+    strategy = ScriptedStrategy([Signal.BUY, Signal.HOLD, Signal.HOLD])
+    config = BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    stop_fill = report.fills[1]
+    assert isinstance(stop_fill, TrailingStopFill)
+    assert stop_fill.trigger_kind is TrailingStopTriggerKind.INTRABAR
+    assert stop_fill.trigger_candle_open_time == rows[2].open_time
+    assert stop_fill.high_watermark == Decimal("120")
+    assert stop_fill.active_stop_price == Decimal("108.00")
+    assert stop_fill.execution_price == Decimal("108.00")
+    assert report.final_equity == Decimal("1080.0")
+
+
+def test_gap_through_trailing_stop_executes_at_candle_open() -> None:
+    rows = make_rows(
+        ["100", "100", "100"],
+        closes=["100", "115", "95"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("120"), low=Decimal("95"))
+    rows[2] = replace(rows[2], high=Decimal("105"), low=Decimal("90"))
+    strategy = ScriptedStrategy([Signal.BUY, Signal.HOLD, Signal.HOLD])
+    config = BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    stop_fill = report.fills[1]
+    assert isinstance(stop_fill, TrailingStopFill)
+    assert stop_fill.trigger_kind is TrailingStopTriggerKind.GAP_OPEN
+    assert stop_fill.high_watermark == Decimal("120")
+    assert stop_fill.active_stop_price == Decimal("108.00")
+    assert stop_fill.market_reference_price == Decimal("100")
+    assert stop_fill.execution_price == Decimal("100")
+    assert report.final_equity == Decimal("1000")
+
+
+def test_pending_strategy_sell_has_priority_over_trailing_stop() -> None:
+    rows = make_rows(
+        ["100", "100", "100"],
+        closes=["100", "115", "95"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("120"), low=Decimal("95"))
+    rows[2] = replace(rows[2], high=Decimal("105"), low=Decimal("90"))
+    strategy = ScriptedStrategy([Signal.BUY, Signal.SELL, Signal.HOLD])
+    config = BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    assert len(report.fills) == 2
+    assert isinstance(report.fills[1], SimulatedFill)
+    assert report.fills[1].execution_price == Decimal("100")
+    assert not any(
+        isinstance(fill, TrailingStopFill)
+        for fill in report.fills
+    )
+
+
+def test_repeated_buy_is_skipped_before_trailing_stop_exit() -> None:
+    rows = make_rows(
+        ["100", "100", "110"],
+        closes=["100", "115", "109"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("120"), low=Decimal("95"))
+    rows[2] = replace(rows[2], high=Decimal("112"), low=Decimal("107"))
+    strategy = ScriptedStrategy([Signal.BUY, Signal.BUY, Signal.HOLD])
+    config = BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    assert len(report.skipped_decisions) == 1
+    assert report.skipped_decisions[0].decision.signal is Signal.BUY
+    assert report.skipped_decisions[0].reason == (
+        "BUY ignored because the portfolio already holds the base asset"
+    )
+    assert isinstance(report.fills[-1], TrailingStopFill)
+    assert report.final_state.base_balance == 0
+
+
+def test_strategy_sell_after_trailing_exit_is_skipped_while_flat() -> None:
+    rows = make_rows(
+        ["100", "100", "110", "100"],
+        closes=["100", "115", "109", "100"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("120"), low=Decimal("95"))
+    rows[2] = replace(rows[2], high=Decimal("112"), low=Decimal("107"))
+    strategy = ScriptedStrategy([
+        Signal.BUY,
+        Signal.HOLD,
+        Signal.SELL,
+        Signal.HOLD,
+    ])
+    config = BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    assert isinstance(report.fills[-1], TrailingStopFill)
+    assert len(report.skipped_decisions) == 1
+    assert report.skipped_decisions[0].decision.signal is Signal.SELL
+    assert report.skipped_decisions[0].reason == (
+        "SELL ignored because the portfolio is flat"
+    )
+
+
+def test_buy_after_stop_reenters_with_a_reset_high_watermark() -> None:
+    rows = make_rows(
+        ["100", "100", "110", "90", "96"],
+        closes=["100", "115", "109", "94", "97"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("120"), low=Decimal("95"))
+    rows[2] = replace(rows[2], high=Decimal("112"), low=Decimal("107"))
+    rows[3] = replace(rows[3], high=Decimal("95"), low=Decimal("85"))
+    rows[4] = replace(rows[4], high=Decimal("100"), low=Decimal("90"))
+    strategy = ScriptedStrategy([
+        Signal.BUY,
+        Signal.HOLD,
+        Signal.BUY,
+        Signal.HOLD,
+        Signal.HOLD,
+    ])
+    config = BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    assert [fill.side for fill in report.fills] == [
+        Signal.BUY,
+        Signal.SELL,
+        Signal.BUY,
+    ]
+    assert isinstance(report.fills[1], TrailingStopFill)
+    assert isinstance(report.fills[2], SimulatedFill)
+    assert report.fills[2].execution_price == Decimal("90")
+    assert report.final_state.base_balance > 0
+    assert report.completed_trade_count == 1
+
+
+def test_trailing_stop_sell_uses_existing_fee_and_slippage_accounting() -> None:
+    rows = make_rows(["100", "100"], closes=["100", "90"])
+    rows[1] = replace(rows[1], high=Decimal("101"), low=Decimal("80"))
+    strategy = ScriptedStrategy([Signal.BUY, Signal.HOLD])
+    config = BacktestConfig(trailing_stop_rate=Decimal("0.10"))
+
+    report = BacktestEngine(config).run(strategy, "BTCUSDT", "1h", rows)
+
+    buy_notional = Decimal("1000") / Decimal("1.001")
+    entry_price = Decimal("100") * Decimal("1.0005")
+    quantity = buy_notional / entry_price
+    active_stop = entry_price * Decimal("0.90")
+    exit_price = active_stop * Decimal("0.9995")
+    exit_notional = quantity * exit_price
+    exit_fee = exit_notional * Decimal("0.001")
+    expected_cash = exit_notional - exit_fee
+
+    stop_fill = report.fills[1]
+    assert isinstance(stop_fill, TrailingStopFill)
+    assert stop_fill.active_stop_price == active_stop
+    assert stop_fill.execution_price == exit_price
+    assert stop_fill.fee == exit_fee
+    assert report.final_state.quote_balance == expected_cash
+    assert report.realized_pnl == expected_cash - Decimal("1000")
+    assert report.realized_pnl == report.completed_trades[0].pnl
+    assert report.fees_paid == sum(
+        (fill.fee for fill in report.fills),
+        Decimal("0"),
+    )
+
+
+def test_detailed_report_identifies_trailing_stop_exit() -> None:
+    rows = make_rows(["100", "100"], closes=["100", "95"])
+    rows[1] = replace(rows[1], high=Decimal("105"), low=Decimal("89"))
+    strategy = ScriptedStrategy([Signal.BUY, Signal.HOLD])
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        trailing_stop_rate=Decimal("0.10"),
+    )).run(strategy, "BTCUSDT", "1h", rows)
+
+    output = format_backtest_report(report, show_trades=True)
+
+    assert "Trailing stop:    10.0000%" in output
+    assert "Trailing exits:   1" in output
+    assert "Exit trailing stop: trigger=intrabar" in output
+    assert "active_stop=90.00 USDT" in output
+    assert "market_reference=90.00 USDT" in output
+    assert "Exit signal available/execution" not in output
+
+
 class InvalidSignalStrategy:
     name = "invalid_signal"
     minimum_history = 1
@@ -414,6 +691,11 @@ def test_invalid_feature_rows_are_rejected(
         {"fee_rate": Decimal("-0.001")},
         {"fee_rate": Decimal("1")},
         {"slippage_rate": Decimal("1")},
+        {"trailing_stop_rate": Decimal("0")},
+        {"trailing_stop_rate": Decimal("-0.01")},
+        {"trailing_stop_rate": Decimal("1")},
+        {"trailing_stop_rate": Decimal("NaN")},
+        {"trailing_stop_rate": Decimal("Infinity")},
     ],
 )
 def test_backtest_config_rejects_invalid_accounting_parameters(

@@ -1,8 +1,11 @@
 """HTTP client for public Binance Spot market data."""
 
+from collections.abc import Callable
 from typing import Any
 
 import httpx
+
+from cryptolab.market_data.http import RetryPolicy, get_public_json
 
 
 class BinanceSpotClient:
@@ -16,9 +19,15 @@ class BinanceSpotClient:
         *,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         transport: httpx.BaseTransport | None = None,
+        retry_policy: RetryPolicy | None = None,
+        sleep: Callable[[float], None] | None = None,
+        jitter: Callable[[], float] | None = None,
     ) -> None:
         self._timeout = httpx.Timeout(timeout)
         self._transport = transport
+        self._retry_policy = retry_policy or RetryPolicy()
+        self._sleep = sleep
+        self._jitter = jitter
 
     def get_klines(
         self,
@@ -40,11 +49,18 @@ class BinanceSpotClient:
         if end_time is not None:
             params["endTime"] = end_time
 
-        with httpx.Client(
+        kwargs: dict[str, object] = {}
+        if self._sleep is not None:
+            kwargs["sleep"] = self._sleep
+        if self._jitter is not None:
+            kwargs["jitter"] = self._jitter
+        return get_public_json(
+            exchange="binance",
+            url=self.KLINES_URL,
+            params=params,
             timeout=self._timeout,
             transport=self._transport,
-        ) as client:
-            response = client.get(self.KLINES_URL, params=params)
-            response.raise_for_status()
-            return response.json()
+            retry_policy=self._retry_policy,
+            **kwargs,
+        )
 

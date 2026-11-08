@@ -1,5 +1,7 @@
 """Completeness checks for stored historical candles."""
 
+import time
+from collections import Counter
 from dataclasses import dataclass
 
 from cryptolab.market_data.intervals import (
@@ -12,6 +14,10 @@ from cryptolab.market_data.markets import (
     validate_market_identity,
 )
 from cryptolab.storage.sqlite_repository import SQLiteRepository
+from cryptolab.market_data.validator import (
+    validate_candle,
+    validate_candle_timing,
+)
 
 
 @dataclass(frozen=True)
@@ -33,12 +39,30 @@ class DataQualityReport:
     missing_open_times: tuple[int, ...]
     exchange: str = DEFAULT_EXCHANGE
     market_type: str = SPOT_MARKET_TYPE
+    unexpected_candles: int = 0
+    unexpected_open_times: tuple[int, ...] = ()
+    duplicate_candles: int = 0
+    duplicate_open_times: tuple[int, ...] = ()
+    invalid_candles: int = 0
+    invalid_reasons: tuple[str, ...] = ()
+
+    @property
+    def is_valid(self) -> bool:
+        """Whether the stored range exactly matches a valid candle grid."""
+        return (
+            self.missing_candles == 0
+            and self.unexpected_candles == 0
+            and self.duplicate_candles == 0
+            and self.invalid_candles == 0
+            and self.actual_candles == self.expected_candles
+        )
 
 
 class DataQualityChecker:
     """Check whether all expected candles exist in SQLite."""
 
     MAX_MISSING_OPEN_TIMES = 1000
+    MAX_ISSUE_DETAILS = 1000
 
     INTERVAL_MILLISECONDS = SUPPORTED_INTERVAL_MILLISECONDS
 
@@ -54,8 +78,9 @@ class DataQualityChecker:
         *,
         exchange: str = DEFAULT_EXCHANGE,
         market_type: str = SPOT_MARKET_TYPE,
+        as_of_time: int | None = None,
     ) -> DataQualityReport:
-        """Check candle completeness in the range [start_time, end_time)."""
+        """Validate exact candle coverage in ``[start_time, end_time)``."""
         validate_market_identity(exchange, market_type)
         interval_milliseconds = get_interval_milliseconds(interval)
 
@@ -84,21 +109,55 @@ class DataQualityChecker:
                 exchange=exchange,
                 market_type=market_type,
             )
-        actual_open_times = {candle.open_time for candle in candles}
-        expected_open_times = range(
+        evaluation_time = (
+            int(time.time() * 1000)
+            if as_of_time is None
+            else as_of_time
+        )
+        counts = Counter(candle.open_time for candle in candles)
+        actual_open_times = set(counts)
+        expected_range = range(
             start_time,
             end_time,
             interval_milliseconds,
         )
+        expected_open_times = set(expected_range)
         missing_candles = 0
         missing_open_times: list[int] = []
-        for open_time in expected_open_times:
+        for open_time in expected_range:
             if open_time in actual_open_times:
                 continue
 
             missing_candles += 1
             if len(missing_open_times) < self.MAX_MISSING_OPEN_TIMES:
                 missing_open_times.append(open_time)
+
+        unexpected_open_times = sorted(
+            actual_open_times - expected_open_times
+        )
+        duplicate_open_times = sorted(
+            open_time for open_time, count in counts.items() if count > 1
+        )
+        duplicate_candles = sum(
+            count - 1 for count in counts.values() if count > 1
+        )
+
+        invalid_reasons: list[str] = []
+        invalid_candles = 0
+        for index, candle in enumerate(candles):
+            try:
+                validate_candle(candle)
+                validate_candle_timing(
+                    candle,
+                    interval,
+                    as_of_time=evaluation_time,
+                )
+            except ValueError as error:
+                invalid_candles += 1
+                if len(invalid_reasons) < self.MAX_ISSUE_DETAILS:
+                    invalid_reasons.append(
+                        f"index {index}, open_time={candle.open_time}: {error}"
+                    )
 
         expected_candles = (end_time - start_time) // interval_milliseconds
 
@@ -113,5 +172,15 @@ class DataQualityChecker:
             missing_open_times=tuple(missing_open_times),
             exchange=exchange,
             market_type=market_type,
+            unexpected_candles=len(unexpected_open_times),
+            unexpected_open_times=tuple(
+                unexpected_open_times[:self.MAX_ISSUE_DETAILS]
+            ),
+            duplicate_candles=duplicate_candles,
+            duplicate_open_times=tuple(
+                duplicate_open_times[:self.MAX_ISSUE_DETAILS]
+            ),
+            invalid_candles=invalid_candles,
+            invalid_reasons=tuple(invalid_reasons),
         )
 

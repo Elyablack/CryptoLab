@@ -1,0 +1,20 @@
+Strategy: trend_following
+Final equity: 1040.00 USDT
+Total return: 4.0000%
+Fees paid: 2.00 USDT
+Max drawdown: -3.0000%
+Completed trades: 1
+Open base asset: 0
+Trailing exits: 1
+
+Completed trade details
+Trade 99:
+  Entry signal available/execution: 2025-01-01T01:00:00Z (0 ms) / 2025-01-01T01:00:00Z (0 ms)
+  Exit trailing stop: trigger=intrabar, candle=2025-01-01T03:00:00Z (0 ms)
+  Stop levels: high_watermark=111.00 USDT, active_stop=105.00 USDT, market_reference=105.00 USDT
+  Prices: entry=100.00 USDT, exit=105.00 USDT
+  BTC quantity: 9.00
+  Fees: entry=1.00 USDT, exit=1.00 USDT
+  Net PnL: 40.00 USDT (4.0000%)
+
+Skipped actionable signals

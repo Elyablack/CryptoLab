@@ -2,6 +2,7 @@
 
 import time
 from collections.abc import Sequence
+from decimal import Decimal
 
 from cryptolab.market_data.intervals import get_interval_milliseconds
 from cryptolab.market_data.models import Candle
@@ -16,6 +17,10 @@ def validate_candle(candle: Candle) -> None:
         "close": candle.close,
     }
     for field_name, value in prices.items():
+        if not isinstance(value, Decimal) or not value.is_finite():
+            raise ValueError(
+                f"{field_name} price must be a finite Decimal"
+            )
         if value <= 0:
             raise ValueError(f"{field_name} price must be strictly positive")
 
@@ -44,6 +49,8 @@ def validate_candle(candle: Candle) -> None:
     if candle.taker_buy_quote_volume is not None:
         volumes["taker_buy_quote_volume"] = candle.taker_buy_quote_volume
     for field_name, value in volumes.items():
+        if not isinstance(value, Decimal) or not value.is_finite():
+            raise ValueError(f"{field_name} must be a finite Decimal")
         if value < 0:
             raise ValueError(f"{field_name} must be non-negative")
 
@@ -59,9 +66,16 @@ def validate_candle(candle: Candle) -> None:
     ):
         raise ValueError("taker_buy_quote_volume cannot exceed quote_volume")
 
-    if candle.number_of_trades is not None and candle.number_of_trades < 0:
-        raise ValueError("number_of_trades must be non-negative")
+    if candle.number_of_trades is not None:
+        if type(candle.number_of_trades) is not int:
+            raise ValueError("number_of_trades must be an integer")
+        if candle.number_of_trades < 0:
+            raise ValueError("number_of_trades must be non-negative")
 
+    if type(candle.open_time) is not int:
+        raise ValueError("open_time must be an integer")
+    if type(candle.close_time) is not int:
+        raise ValueError("close_time must be an integer")
     if candle.open_time < 0:
         raise ValueError("open_time must be non-negative")
 
@@ -88,6 +102,32 @@ def validate_candles(candles: Sequence[Candle]) -> None:
         previous_open_time = candle.open_time
 
 
+def validate_candle_timing(
+    candle: Candle,
+    interval: str,
+    *,
+    as_of_time: int | None = None,
+    require_closed: bool = True,
+) -> None:
+    """Validate interval alignment, close time, and optional closed status."""
+    interval_milliseconds = get_interval_milliseconds(interval)
+    if candle.open_time % interval_milliseconds != 0:
+        raise ValueError(f"open_time must be aligned to interval {interval}")
+
+    expected_close_time = candle.open_time + interval_milliseconds - 1
+    if candle.close_time != expected_close_time:
+        raise ValueError(f"close_time does not match interval {interval}")
+
+    if require_closed:
+        evaluation_time = (
+            int(time.time() * 1000)
+            if as_of_time is None
+            else as_of_time
+        )
+        if candle.close_time >= evaluation_time:
+            raise ValueError("candle is not closed")
+
+
 def validate_historical_candles(
     candles: Sequence[Candle],
     interval: str,
@@ -111,11 +151,14 @@ def validate_historical_candles(
     previous_open_time: int | None = None
 
     for index, candle in enumerate(candles):
-        if candle.open_time % interval_milliseconds != 0:
-            raise ValueError(
-                f"Candle at index {index}: open_time must be aligned "
-                f"to interval {interval}"
+        try:
+            validate_candle_timing(
+                candle,
+                interval,
+                as_of_time=evaluation_time,
             )
+        except ValueError as error:
+            raise ValueError(f"Candle at index {index}: {error}") from error
 
         if (
             previous_open_time is not None
@@ -126,16 +169,6 @@ def validate_historical_candles(
                 f"Candle at index {index}: candles must be consecutive "
                 f"for interval {interval}"
             )
-
-        expected_close_time = candle.open_time + interval_milliseconds - 1
-        if candle.close_time != expected_close_time:
-            raise ValueError(
-                f"Candle at index {index}: close_time does not match "
-                f"interval {interval}"
-            )
-
-        if candle.close_time >= evaluation_time:
-            raise ValueError(f"Candle at index {index} is not closed")
 
         previous_open_time = candle.open_time
 

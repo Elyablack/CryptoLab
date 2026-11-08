@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -6,6 +7,7 @@ import pytest
 
 import cryptolab.cli as cli_module
 from cryptolab.cli import main
+from cryptolab.market_data.collector import CollectionResult
 from cryptolab.market_data.models import Candle
 from cryptolab.storage.sqlite_repository import SQLiteRepository
 
@@ -38,13 +40,36 @@ class FakeCollector:
         interval: str,
         start_time: int,
         end_time: int,
-    ) -> None:
+    ) -> CollectionResult:
         self.collect_call = {
             "symbol": symbol,
             "interval": interval,
             "start_time": start_time,
             "end_time": end_time,
         }
+        expected = (end_time - start_time) // 3_600_000
+        exchange = str(self.configuration.get("exchange", "binance"))
+        market_type = str(self.configuration.get("market_type", "spot"))
+        return CollectionResult(
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            interval=interval,
+            start_time=start_time,
+            end_time=end_time,
+            expected=expected,
+            received=expected,
+            inserted=expected,
+            existing=0,
+            conflicting=0,
+            missing=0,
+            invalid=0,
+            unexpected=0,
+            excluded_unfinished=0,
+            empty_pages=0,
+            conflict_open_times=(),
+            missing_open_times=(),
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -74,6 +99,7 @@ def test_collect_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--exchange" in output
     assert "--symbol" in output
     assert "--database" in output
+    assert "--verbose" in output
 
 
 def test_quality_help(capsys: pytest.CaptureFixture[str]) -> None:
@@ -189,6 +215,88 @@ def test_collect_uses_default_database_path(
 
     assert exit_code == 0
     assert (tmp_path / "data" / "market_data.db").exists()
+
+
+def test_collect_returns_nonzero_for_incomplete_coverage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class IncompleteCollector(FakeCollector):
+        def collect(self, *args, **kwargs) -> CollectionResult:
+            result = super().collect(*args, **kwargs)
+            return replace(
+                result,
+                missing=1,
+                missing_open_times=(result.start_time,),
+                failure_reason="Persisted candle coverage is incomplete",
+            )
+
+    monkeypatch.setattr(
+        cli_module,
+        "HistoricalDataCollector",
+        IncompleteCollector,
+    )
+
+    exit_code = main([
+        "collect",
+        "--symbol",
+        "BTCUSDT",
+        "--interval",
+        "1h",
+        "--start",
+        "2024-01-01",
+        "--end",
+        "2024-01-02",
+        "--database",
+        str(tmp_path / "market_data.db"),
+    ])
+
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "missing=1" in captured.out
+    assert "Collection incomplete" in captured.err
+
+
+def test_quality_returns_nonzero_for_invalid_stored_candle(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "invalid.db"
+    repository = SQLiteRepository(database_path)
+    repository.init_schema()
+    repository.save_candles("BTCUSDT", "1d", [Candle(
+        open_time=0,
+        open=Decimal("100"),
+        high=Decimal("99"),
+        low=Decimal("90"),
+        close=Decimal("95"),
+        volume=Decimal("1"),
+        close_time=86_399_999,
+        quote_volume=Decimal("100"),
+        number_of_trades=1,
+        taker_buy_base_volume=Decimal("0.5"),
+        taker_buy_quote_volume=Decimal("50"),
+    )])
+
+    exit_code = main([
+        "quality",
+        "--symbol",
+        "BTCUSDT",
+        "--interval",
+        "1d",
+        "--start",
+        "1970-01-01",
+        "--end",
+        "1970-01-02",
+        "--database",
+        str(database_path),
+    ])
+
+    output = capsys.readouterr().out
+    assert exit_code == 1
+    assert "missing_candles=0" in output
+    assert "invalid_candles=1" in output
 
 
 def test_collect_rejects_invalid_date_format(
