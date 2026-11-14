@@ -1,4 +1,4 @@
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 
 import pytest
 
@@ -166,3 +166,75 @@ def test_duplicate_and_overfill_are_rejected_without_state_change() -> None:
     assert accounting.quote_balance == Decimal("900")
     assert accounting.base_balance(INSTRUMENT) == Decimal("1")
     assert accounting.realizations == ()
+
+
+def test_partial_sell_accumulates_pnl_in_fifo_order() -> None:
+    accounting = PortfolioAccounting(Decimal("100"))
+    # Use four significant digits so regrouping changes a small example:
+    # (1000 + 0.4) + 0.4 rounds to 1000, while 1000 + (0.4 + 0.4) gives 1001.
+    with localcontext(Context(prec=4)):
+        for index in (1, 2):
+            accounting.record_buy(
+                fill_id=f"buy-{index}",
+                instrument=INSTRUMENT,
+                quantity=Decimal("2"),
+                execution_price=Decimal("1"),
+                quote_notional=Decimal("2"),
+                fee=Decimal("0"),
+                executed_at=index,
+            )
+        accounting.record_sell(
+            fill_id="sell-1",
+            instrument=INSTRUMENT,
+            quantity=Decimal("1"),
+            execution_price=Decimal("1001"),
+            gross_proceeds=Decimal("1001"),
+            fee=Decimal("0"),
+            executed_at=3,
+        )
+        realizations = accounting.record_sell(
+            fill_id="sell-2",
+            instrument=INSTRUMENT,
+            quantity=Decimal("2"),
+            execution_price=Decimal("1.4"),
+            gross_proceeds=Decimal("2.8"),
+            fee=Decimal("0"),
+            executed_at=4,
+        )
+
+        assert [item.realized_pnl for item in realizations] == [
+            Decimal("0.4"),
+            Decimal("0.4"),
+        ]
+        assert accounting.base_balance(INSTRUMENT) == Decimal("1")
+        assert accounting.realized_pnl == Decimal("1000")
+        assert accounting.cycles[0].realized_pnl == accounting.realized_pnl
+        accounting.assert_invariants()
+
+
+def test_realized_pnl_invariant_rejects_material_discrepancy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accounting = PortfolioAccounting(Decimal("1000"))
+    accounting.record_buy(
+        fill_id="buy-1",
+        instrument=INSTRUMENT,
+        quantity=Decimal("2"),
+        execution_price=Decimal("100"),
+        quote_notional=Decimal("200"),
+        fee=Decimal("0"),
+        executed_at=1,
+    )
+    accounting.record_sell(
+        fill_id="sell-1",
+        instrument=INSTRUMENT,
+        quantity=Decimal("1"),
+        execution_price=Decimal("110"),
+        gross_proceeds=Decimal("110"),
+        fee=Decimal("0"),
+        executed_at=2,
+    )
+
+    monkeypatch.setattr(accounting, "_realized_pnl", Decimal("15"))
+    with pytest.raises(RuntimeError, match="Realized PnL does not match lot realizations"):
+        accounting.assert_invariants()

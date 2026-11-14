@@ -410,9 +410,6 @@ class PortfolioAccounting:
         self._lots[instrument] = updated_lots
         self._quote_balance += gross_proceeds - fee
         self._fees_paid += fee
-        self._realized_pnl += sum(
-            (item.realized_pnl for item in realizations), ZERO
-        )
         self._realizations.extend(realizations)
         self._processed_fill_ids.add(fill_id)
 
@@ -421,9 +418,11 @@ class PortfolioAccounting:
         cycle.realization_ids.extend(
             item.realization_id for item in realizations
         )
-        cycle.realized_pnl += sum(
-            (item.realized_pnl for item in realizations), ZERO
-        )
+        # Accumulate in FIFO realization order, as in the reconciliation.
+        # Decimal addition can round differently when grouped by fill.
+        for item in realizations:
+            self._realized_pnl += item.realized_pnl
+            cycle.realized_pnl += item.realized_pnl
         if self.base_balance(instrument) == 0:
             cycle.closed_at = executed_at
             del self._active_cycles[instrument]
