@@ -23,10 +23,16 @@ CLI
 │                                      ├── OrderIntent → Order → Fill
 │                                      ├── FIFO PortfolioAccounting
 │                                      └── optional trailing stop
-└── research ─ quality ── StrategyResearchRunner
-                         ├── three independent BacktestEngine runs
-                         ├── buy-and-hold and cash-only
-                         └── signal/trade diagnostics
+├── research ─ quality ── StrategyResearchRunner
+│                        ├── three independent BacktestEngine runs
+│                        ├── buy-and-hold and cash-only
+│                        └── signal/trade diagnostics
+└── optimize ─ quality ── StrategyOptimizationRunner
+                         ├── bounded ParameterGrid
+                         ├── chronological train/validation/test gates
+                         ├── independent BacktestEngine evaluations
+                         ├── period benchmarks and optional walk-forward
+                         └── text plus JSON/CSV reports
 ```
 
 ### Market data
@@ -97,6 +103,23 @@ restart snapshots, and state reconciliation. Neither adapter performs I/O.
 `StrategyResearchRunner` runs unchanged strategies, deterministic benchmarks,
 and diagnostic condition counts. Generated reports and local databases are
 runtime artifacts rather than source fixtures.
+
+`StrategyOptimizationRunner` builds features once, then applies immutable
+parameter sets to the existing strategy dataclasses. `PeriodRestrictedStrategy`
+retains all preceding feature rows for indicator warm-up but changes pre-period
+decisions to HOLD. Every train, validation, and test evaluation starts with a
+fresh virtual portfolio. Positions are not carried or force-closed across
+boundaries. The selection score uses train/validation evidence and a minimum
+trade filter; only the selected configuration and unchanged baseline reach the
+test period. Optional expanding-window folds are post-selection diagnostics and
+remain entirely before the test boundary.
+
+The optimizer is deliberately a bounded grid evaluator rather than a generic
+search framework. A strict global combination cap prevents accidental
+unbounded work. Decimal parameters and metrics retain exact string
+representations in the JSON output; CSV contains one train/validation row per
+configuration. Generated optimization reports remain ignored runtime
+artifacts.
 
 ## Collection state machine
 
@@ -199,6 +222,8 @@ state if any migration step fails.
 - FIFO lot quantity, remaining cost, fees, and realizations reconcile after
   every accounting event.
 - Trailing high updates only after the current candle stop check.
+- Optimization ranking never reads holdout metrics; feature rows after a
+  period's `end_time` are removed by the existing `as_of_time` boundary.
 
 ## Operational model
 
@@ -230,7 +255,7 @@ current implementation authenticates or communicates with a trading endpoint.
 - no historical conflict auto-resolution;
 - no multi-writer SQLite coordination;
 - no scheduler or monitoring service;
-- no machine-readable CLI output yet;
+- machine-readable output is limited to optimization JSON/CSV reports;
 - no authenticated paper/testnet/live venue adapter or durable order store;
 - multi-symbol backtests require aligned timelines, one strategy, and a
   common exchange/interval/USDT balance;

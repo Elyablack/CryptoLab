@@ -68,6 +68,7 @@ cryptolab analyze  --exchange bybit --symbol BTCUSDT --interval 1h --start 2025-
 cryptolab signals  --exchange bybit --symbol BTCUSDT --interval 1h --start 2025-01-01 --end 2025-02-01 --database data/market_data.db --strategy all
 cryptolab backtest --exchange bybit --symbol BTCUSDT --interval 1h --start 2025-01-01 --end 2025-02-01 --database data/market_data.db --strategy all --show-trades
 cryptolab research --exchange bybit --symbol BTCUSDT --interval 1h --start 2025-01-01 --end 2025-02-01 --database data/market_data.db --fee-rate 0.001
+cryptolab optimize --exchange bybit --symbol BTCUSDT --interval 1h --start 2023-11-01 --end 2026-11-01 --database data/market_data.db --strategy all --output-json reports/optimization.json --output-csv reports/optimization.csv
 ```
 
 All date ranges use UTC and half-open semantics: `[start, end)`.
@@ -82,6 +83,7 @@ All date ranges use UTC and half-open semantics: `[start, end)`.
 | `signals` | Inspect historical BUY/SELL research events | No |
 | `backtest` | Simulate independent long-only Spot portfolios | No |
 | `research` | Compare strategies with buy-and-hold and cash benchmarks | No |
+| `optimize` | Run bounded chronological parameter research | No |
 
 Every command supports `--exchange {binance,bybit}`, `--symbol`, `--interval`,
 `--start`, `--end`, and `--database`. Binance remains the default exchange.
@@ -187,6 +189,68 @@ The unchanged research strategies are:
 
 Signals are market-research events, not orders. Spot `SELL` means reduce or
 exit an existing long exposure; it never opens a short position.
+
+## Strategy optimization research
+
+`optimize` evaluates deterministic, explicitly bounded grids for the existing
+Trend Following, Mean Reversion, and Breakout strategies. It does not change
+their defaults and it never submits orders or downloads data. The requested
+SQLite range must first pass the same exact quality checks as backtesting.
+
+The default split is chronological: 60% train, 20% validation, and 20%
+untouched test. Each period starts with a fresh 1000 USDT portfolio. Earlier
+candles remain available only as indicator warm-up; positions are neither
+carried nor artificially closed across period boundaries. A signal formed on
+the last candle of a period remains unexecuted because no next candle exists
+inside that period. Open positions are marked at the final close.
+
+All configurations are evaluated on train and validation. Selection uses
+validation return, validation drawdown, cross-period stability, and a minimum
+completed-trade criterion. The test period is evaluated only after selection;
+it is never used for ranking. If no configuration satisfies the trade-count
+criterion, the report says that the result is inconclusive and does not select
+an optimized configuration. Buy-and-hold and cash-only benchmarks are reported
+for every period.
+
+The built-in grid contains 64 combinations in total and includes all unchanged
+baseline settings. `--max-combinations` is a strict global limit, not silent
+sampling. `--walk-forward-folds` adds expanding-window diagnostics for the
+already selected configuration and does not participate in selection.
+
+Example with machine-readable output:
+
+```bash
+cryptolab optimize \
+  --exchange bybit \
+  --symbol BTCUSDT \
+  --interval 1h \
+  --start 2023-11-01 \
+  --end 2026-11-01 \
+  --database data/market_data.db \
+  --strategy all \
+  --min-trades 3 \
+  --max-combinations 100 \
+  --walk-forward-folds 3 \
+  --output-json reports/btcusdt-optimization.json \
+  --output-csv reports/btcusdt-grid.csv
+```
+
+A custom JSON grid maps internal strategy names to arrays. Omitted parameters
+retain their strategy defaults:
+
+```json
+{
+  "trend_following": {
+    "buy_rsi_min": ["45", "50"],
+    "exit_policy": ["confirmed", "crossover_only"]
+  }
+}
+```
+
+Pass it with `--grid-json path/to/grid.json`. Decimal values are strings in
+JSON reports to preserve exact representation. Optimization output is research
+evidence, not a profitability claim; small trade counts and unstable
+train/validation behavior are reported as warnings.
 
 ## Backtesting assumptions
 
@@ -301,8 +365,9 @@ python -m venv /tmp/cryptolab-wheel-test
 ```
 
 GitHub Actions runs the offline suite on Python 3.12 and 3.13, compiles source
-files, smoke-tests all six commands, builds and installs the wheel, runs Ruff,
-audits dependencies with `pip-audit`, and scans the repository with Gitleaks.
+files, smoke-tests the release commands, builds and installs the wheel, runs
+Ruff, audits dependencies with `pip-audit`, and scans the repository with
+Gitleaks.
 CI results must be checked on GitHub; local success is not a claim that hosted
 CI has run.
 
@@ -318,5 +383,6 @@ request classifications and timestamps, not credentials or full private
 headers.
 
 See [architecture](docs/architecture.md),
+[strategy optimization](docs/strategy-optimization.md),
 [ADR 0001](docs/decisions/0001-initial-architecture.md), and
 [ADR 0002](docs/decisions/0002-data-integrity-and-release.md).

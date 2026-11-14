@@ -1,6 +1,7 @@
 """Command-line interface for CryptoLab."""
 
 import argparse
+import json
 import logging
 import sys
 from datetime import UTC, datetime
@@ -39,6 +40,16 @@ from cryptolab.market_data.markets import (
 from cryptolab.market_data.parser import parse_bybit_klines
 from cryptolab.research import StrategyResearchRunner
 from cryptolab.research.formatter import format_research_report
+from cryptolab.research.optimization import StrategyOptimizationRunner
+from cryptolab.research.optimization_formatter import (
+    format_optimization_report,
+    optimization_report_to_csv,
+    optimization_report_to_json,
+)
+from cryptolab.research.parameter_grid import (
+    default_parameter_grids,
+    grid_from_mapping,
+)
 from cryptolab.storage.sqlite_repository import SQLiteRepository
 from cryptolab.strategies import (
     BreakoutStrategy,
@@ -64,6 +75,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--end must be later than --start")
     if args.command == "backtest":
         _validate_backtest_arguments(parser, args)
+    if args.command == "optimize":
+        _validate_optimize_arguments(parser, args)
 
     start_time = int(args.start.timestamp() * 1000)
     end_time = int(args.end.timestamp() * 1000)
@@ -86,6 +99,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "research":
         return _run_research(args, start_time, end_time, database_path)
+
+    if args.command == "optimize":
+        return _run_optimize(args, start_time, end_time, database_path)
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -546,6 +562,84 @@ def _run_research(
     return 0
 
 
+def _run_optimize(
+    args: argparse.Namespace,
+    start_time: int,
+    end_time: int,
+    database_path: Path,
+) -> int:
+    """Run bounded chronological research without network access."""
+    try:
+        if not database_path.is_file():
+            raise FileNotFoundError(
+                f"Database does not exist: {database_path}"
+            )
+        repository = SQLiteRepository(database_path)
+        repository.init_schema()
+        quality = DataQualityChecker(repository).check(
+            symbol=args.symbol,
+            interval=args.interval,
+            start_time=start_time,
+            end_time=end_time,
+            as_of_time=end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        if not quality.is_valid:
+            raise ValueError(
+                "Cannot optimize invalid historical data: "
+                f"missing={quality.missing_candles}, "
+                f"unexpected={quality.unexpected_candles}, "
+                f"duplicates={quality.duplicate_candles}, "
+                f"invalid={quality.invalid_candles}"
+            )
+        candles = repository.get_candles_by_range(
+            args.symbol,
+            args.interval,
+            start_time,
+            end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        report = StrategyOptimizationRunner(BacktestConfig(
+            fee_rate=args.fee_rate,
+        )).run(
+            args.symbol,
+            args.interval,
+            candles,
+            _load_optimization_grids(args),
+            exchange=args.exchange,
+            market_type=SPOT_MARKET_TYPE,
+            as_of_time=end_time,
+            train_fraction=args.train_fraction,
+            validation_fraction=args.validation_fraction,
+            minimum_completed_trades=args.min_trades,
+            max_combinations=args.max_combinations,
+            walk_forward_folds=args.walk_forward_folds,
+        )
+        if args.output_json is not None:
+            args.output_json.parent.mkdir(parents=True, exist_ok=True)
+            args.output_json.write_text(
+                optimization_report_to_json(report),
+                encoding="utf-8",
+            )
+        if args.output_csv is not None:
+            args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+            args.output_csv.write_text(
+                optimization_report_to_csv(report),
+                encoding="utf-8",
+            )
+    except Exception as error:
+        print(f"Optimization failed: {error}", file=sys.stderr)
+        LOGGER.debug("Optimization failure details", exc_info=True)
+        return 1
+
+    print(format_optimization_report(report))
+    if args.output_json is not None:
+        print(f"JSON report: {args.output_json}")
+    if args.output_csv is not None:
+        print(f"CSV grid results: {args.output_csv}")
+    return 0
+
+
 def _create_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -683,6 +777,77 @@ def _create_parser() -> argparse.ArgumentParser:
         help="fee fraction per fill (default: 0.001 = 0.1%%)",
     )
 
+    optimize_parser = subparsers.add_parser(
+        "optimize",
+        help="run bounded chronological strategy-parameter research",
+        description=(
+            "Evaluate deterministic parameter grids using train, validation, "
+            "and untouched test periods; no exchange orders are created"
+        ),
+    )
+    _add_common_arguments(optimize_parser)
+    optimize_parser.add_argument(
+        "--strategy",
+        choices=("all", "trend", "mean-reversion", "breakout"),
+        default="all",
+    )
+    optimize_parser.add_argument(
+        "--fee-rate",
+        type=_parse_decimal_rate,
+        default=Decimal("0.001"),
+        metavar="DECIMAL",
+    )
+    optimize_parser.add_argument(
+        "--train-fraction",
+        type=_parse_positive_decimal_rate,
+        default=Decimal("0.6"),
+        metavar="DECIMAL",
+    )
+    optimize_parser.add_argument(
+        "--validation-fraction",
+        type=_parse_positive_decimal_rate,
+        default=Decimal("0.2"),
+        metavar="DECIMAL",
+    )
+    optimize_parser.add_argument(
+        "--min-trades",
+        type=_parse_nonnegative_integer,
+        default=3,
+        metavar="COUNT",
+    )
+    optimize_parser.add_argument(
+        "--max-combinations",
+        type=_parse_positive_integer,
+        default=100,
+        metavar="COUNT",
+    )
+    optimize_parser.add_argument(
+        "--walk-forward-folds",
+        type=_parse_nonnegative_integer,
+        default=0,
+        metavar="COUNT",
+        help="optional post-selection expanding-window diagnostics",
+    )
+    optimize_parser.add_argument(
+        "--grid-json",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="optional JSON mapping of strategy names to parameter arrays",
+    )
+    optimize_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        metavar="PATH",
+    )
+    optimize_parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        metavar="PATH",
+    )
+
     return parser
 
 
@@ -803,6 +968,23 @@ def _parse_position_size_fraction(value: str) -> Decimal:
     return result
 
 
+def _parse_nonnegative_integer(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("value must be an integer") from error
+    if result < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return result
+
+
+def _parse_positive_integer(value: str) -> int:
+    result = _parse_nonnegative_integer(value)
+    if result == 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return result
+
+
 def _validate_backtest_arguments(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
@@ -832,6 +1014,54 @@ def _validate_backtest_arguments(
             "portfolio mode requires --position-size-fraction for explicit "
             "shared-capital allocation"
         )
+
+
+def _validate_optimize_arguments(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    if args.train_fraction + args.validation_fraction >= 1:
+        parser.error(
+            "--train-fraction and --validation-fraction must sum to less than 1"
+        )
+
+
+def _load_optimization_grids(args: argparse.Namespace):
+    requested_names = {
+        "trend": "trend_following",
+        "mean-reversion": "mean_reversion",
+        "breakout": "breakout",
+    }
+    selected = (
+        set(requested_names.values())
+        if args.strategy == "all"
+        else {requested_names[args.strategy]}
+    )
+    if args.grid_json is None:
+        return tuple(
+            grid
+            for grid in default_parameter_grids()
+            if grid.strategy_name in selected
+        )
+
+    try:
+        payload = json.loads(args.grid_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"Cannot read parameter grid JSON: {error}") from error
+    if not isinstance(payload, dict):
+        raise ValueError("Parameter grid JSON root must be an object")
+    missing = selected - set(payload)
+    if missing:
+        raise ValueError(
+            "Parameter grid JSON is missing: " + ", ".join(sorted(missing))
+        )
+    grids = []
+    for name in sorted(selected):
+        axes = payload[name]
+        if not isinstance(axes, dict):
+            raise ValueError(f"Grid for {name} must be a JSON object")
+        grids.append(grid_from_mapping(name, axes))
+    return tuple(grids)
 
 
 def _create_backtest_position_sizer(
