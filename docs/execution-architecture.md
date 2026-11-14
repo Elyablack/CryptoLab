@@ -45,7 +45,9 @@ SELL prevents a second stop execution.
 
 ## Shared-cash portfolios
 
-`BacktestEngine.run_portfolio()` requires identical timestamp grids. Events at
+`BacktestEngine.run_portfolio()` requires identical timestamp grids. The CLI
+uses the primary `--symbol` plus repeatable `--portfolio-symbol`; it rejects
+`--strategy all` and requires `--position-size-fraction` in this mode. Events at
 one open are sorted by exchange, market type, symbol, and strategy name. Each
 event sees the quote balance left by earlier events, so constrained-capital
 allocation is deterministic and explicit. Open equity is the shared quote cash

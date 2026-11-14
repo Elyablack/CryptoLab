@@ -65,7 +65,9 @@ access to exchange clients or portfolio state.
 
 `BacktestEngine.run()` evaluates one strategy and one independent virtual
 long-only portfolio. `run_portfolio()` evaluates aligned instrument streams
-against a shared quote balance. It executes signals at the next open, applies
+against a shared quote balance. The CLI exposes the latter through repeatable
+`--portfolio-symbol`, one explicit `--strategy`, and mandatory fractional
+capital allocation. It executes signals at the next open, applies
 Decimal fees and slippage, retains an equity curve, and asserts accounting
 invariants. Optional trailing-stop fills share the normal SELL settlement path
 and use risk-source intents without fabricated strategy timestamps.
@@ -230,5 +232,6 @@ current implementation authenticates or communicates with a trading endpoint.
 - no scheduler or monitoring service;
 - no machine-readable CLI output yet;
 - no authenticated paper/testnet/live venue adapter or durable order store;
-- multi-symbol backtests require aligned timelines and have no CLI command;
+- multi-symbol backtests require aligned timelines, one strategy, and a
+  common exchange/interval/USDT balance;
 - backtests do not model order books or exchange quantity filters.

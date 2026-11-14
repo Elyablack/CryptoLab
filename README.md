@@ -207,11 +207,39 @@ open a `PositionSizer` calculates the allocation. The execution path records
 typed `OrderIntent`, `Order`, and `Fill` audit objects and applies the fill to
 FIFO `PositionLot` accounting. These objects never submit an exchange order.
 
-The Python API also provides `FixedFractionScaleSizer` for scale-in/scale-out
-research and `BacktestEngine.run_portfolio()` for aligned multi-symbol streams
-sharing one USDT balance. Simultaneous events use a stable instrument order,
-making capital allocation deterministic. `PositionCycle` and
-`LotRealization` preserve flat-to-flat and FIFO audit history.
+Scale-in/scale-out is an explicit opt-in. Both fractions are required to
+select `FixedFractionScaleSizer`; the sell fraction may be `1` when scale-in
+with full exits is desired:
+
+```bash
+cryptolab backtest ... \
+  --position-size-fraction 0.25 \
+  --position-sell-fraction 0.50 \
+  --show-accounting
+```
+
+An aligned multi-symbol portfolio uses the primary `--symbol` plus one or more
+`--portfolio-symbol` values. It requires one explicit strategy and a buy
+fraction so shared-capital allocation cannot be implicit:
+
+```bash
+cryptolab backtest \
+  --exchange bybit \
+  --symbol BTCUSDT \
+  --portfolio-symbol ETHUSDT \
+  --interval 1h \
+  --start 2025-01-01 \
+  --end 2025-02-01 \
+  --database data/market_data.db \
+  --strategy trend \
+  --position-size-fraction 0.50 \
+  --show-trades \
+  --show-accounting
+```
+
+The CLI quality-checks every instrument before feature construction.
+Simultaneous events use the stable engine instrument order. `PositionCycle`
+and `LotRealization` preserve flat-to-flat and FIFO audit history.
 
 An optional research trailing stop is enabled with, for example:
 
@@ -235,8 +263,8 @@ Further model limitations:
   are not modeled by the backtest price model;
 - the order lifecycle supports partial venue fills for offline adapter tests,
   while a candle backtest still creates one immediate fill per intent;
-- multi-symbol backtests currently require identical candle timelines and are
-  available through the Python API rather than the CLI;
+- multi-symbol backtests currently require identical candle timelines and one
+  common exchange, interval, strategy, and USDT quote balance;
 - fees and slippage are assumptions, not account-specific exchange rates.
 
 ## Offline execution adapter

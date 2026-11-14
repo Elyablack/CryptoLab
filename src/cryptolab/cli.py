@@ -13,9 +13,16 @@ from cryptolab.backtesting import (
     BacktestConfig,
     BacktestEngine,
     FixedFractionPositionSizer,
+    FixedFractionScaleSizer,
+    PortfolioBacktestInput,
+    PositionSizer,
 )
-from cryptolab.backtesting.formatter import format_backtest_report
+from cryptolab.backtesting.formatter import (
+    format_backtest_report,
+    format_portfolio_backtest_report,
+)
 from cryptolab.features.builder import FeatureBuilder
+from cryptolab.features.models import FeatureRow
 from cryptolab.market_data.bybit_client import BybitSpotClient
 from cryptolab.market_data.client import BinanceSpotClient
 from cryptolab.market_data.collector import (
@@ -55,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.end <= args.start:
         parser.error("--end must be later than --start")
+    if args.command == "backtest":
+        _validate_backtest_arguments(parser, args)
 
     start_time = int(args.start.timestamp() * 1000)
     end_time = int(args.end.timestamp() * 1000)
@@ -375,7 +384,7 @@ def _run_backtest(
     end_time: int,
     database_path: Path,
 ) -> int:
-    """Backtest each selected strategy with an independent portfolio."""
+    """Run an independent or explicitly shared-cash portfolio backtest."""
     try:
         if not database_path.is_file():
             raise FileNotFoundError(
@@ -384,40 +393,19 @@ def _run_backtest(
 
         repository = SQLiteRepository(database_path)
         repository.init_schema()
-        quality_report = DataQualityChecker(repository).check(
-            symbol=args.symbol,
-            interval=args.interval,
-            start_time=start_time,
-            end_time=end_time,
-            **_market_identity_kwargs(args.exchange),
-        )
-        if quality_report.missing_candles:
-            raise ValueError(
-                "Cannot backtest incomplete historical data: "
-                f"{quality_report.missing_candles} candles are missing"
+        symbols = (args.symbol, *args.portfolio_symbol)
+        rows_by_symbol = {
+            symbol: _load_backtest_rows(
+                repository,
+                symbol=symbol,
+                interval=args.interval,
+                start_time=start_time,
+                end_time=end_time,
+                exchange=args.exchange,
             )
-        if quality_report.actual_candles != quality_report.expected_candles:
-            raise ValueError(
-                "Cannot backtest: actual candle count differs from expected count"
-            )
-
-        candles = repository.get_candles_by_range(
-            args.symbol,
-            args.interval,
-            start_time,
-            end_time,
-            **_market_identity_kwargs(args.exchange),
-        )
-        rows = FeatureBuilder().build(
-            candles,
-            interval=args.interval,
-            as_of_time=end_time,
-        )
-        position_sizer = (
-            None
-            if args.position_size_fraction is None
-            else FixedFractionPositionSizer(args.position_size_fraction)
-        )
+            for symbol in symbols
+        }
+        position_sizer = _create_backtest_position_sizer(args)
         engine = BacktestEngine(
             BacktestConfig(
                 fee_rate=args.fee_rate,
@@ -425,22 +413,62 @@ def _run_backtest(
             ),
             position_sizer=position_sizer,
         )
-        reports = [
-            engine.run(
-                strategy,
-                args.symbol,
-                args.interval,
-                rows,
-                exchange=args.exchange,
-                market_type=SPOT_MARKET_TYPE,
+        strategies = _create_strategies(args.strategy)
+        if args.portfolio_symbol:
+            strategy = strategies[0]
+            portfolio_report = engine.run_portfolio(
+                tuple(
+                    PortfolioBacktestInput(
+                        strategy=strategy,
+                        symbol=symbol,
+                        interval=args.interval,
+                        rows=rows_by_symbol[symbol],
+                        exchange=args.exchange,
+                        market_type=SPOT_MARKET_TYPE,
+                    )
+                    for symbol in symbols
+                ),
                 as_of_time=end_time,
             )
-            for strategy in _create_strategies(args.strategy)
-        ]
+            reports = []
+        else:
+            portfolio_report = None
+            reports = [
+                engine.run(
+                    strategy,
+                    args.symbol,
+                    args.interval,
+                    rows_by_symbol[args.symbol],
+                    exchange=args.exchange,
+                    market_type=SPOT_MARKET_TYPE,
+                    as_of_time=end_time,
+                )
+                for strategy in strategies
+            ]
     except Exception as error:
         print(f"Backtest failed: {error}", file=sys.stderr)
         LOGGER.debug("Backtest failure details", exc_info=True)
         return 1
+
+    if portfolio_report is not None:
+        print(
+            "Shared portfolio backtest: "
+            f"exchange={args.exchange}, market_type={SPOT_MARKET_TYPE}, "
+            f"symbols={','.join(symbols)}, interval={args.interval}, "
+            f"range=[{args.start.date()}, {args.end.date()}), "
+            f"database={database_path}"
+        )
+        print()
+        print(format_portfolio_backtest_report(
+            portfolio_report,
+            strategy_name=strategies[0].name,
+            symbols=symbols,
+            exchange=args.exchange,
+            market_type=SPOT_MARKET_TYPE,
+            show_trades=args.show_trades,
+            show_accounting=args.show_accounting,
+        ))
+        return 0
 
     print(
         "Independent backtests: "
@@ -451,7 +479,11 @@ def _run_backtest(
     )
     for report in reports:
         print()
-        print(format_backtest_report(report, show_trades=args.show_trades))
+        print(format_backtest_report(
+            report,
+            show_trades=args.show_trades,
+            show_accounting=args.show_accounting,
+        ))
 
     return 0
 
@@ -578,6 +610,31 @@ def _create_parser() -> argparse.ArgumentParser:
         "--strategy",
         choices=("all", "trend", "mean-reversion", "breakout"),
         default="all",
+    )
+    backtest_parser.add_argument(
+        "--position-sell-fraction",
+        type=_parse_position_size_fraction,
+        default=None,
+        metavar="DECIMAL",
+        help=(
+            "fraction of the open base position sold on each SELL; requires "
+            "--position-size-fraction and enables scale-in/scale-out"
+        ),
+    )
+    backtest_parser.add_argument(
+        "--portfolio-symbol",
+        action="append",
+        default=[],
+        metavar="SYMBOL",
+        help=(
+            "additional symbol sharing the same USDT portfolio; repeat for "
+            "multiple symbols"
+        ),
+    )
+    backtest_parser.add_argument(
+        "--show-accounting",
+        action="store_true",
+        help="show FIFO lots, lot realizations, and position cycles",
     )
     backtest_parser.add_argument(
         "--fee-rate",
@@ -744,6 +801,112 @@ def _parse_position_size_fraction(value: str) -> Decimal:
             "position size fraction must be between 0 and 1 inclusive"
         )
     return result
+
+
+def _validate_backtest_arguments(
+    parser: argparse.ArgumentParser,
+    args: argparse.Namespace,
+) -> None:
+    """Reject combinations whose allocation semantics would be ambiguous."""
+    if (
+        args.position_sell_fraction is not None
+        and args.position_size_fraction is None
+    ):
+        parser.error(
+            "--position-sell-fraction requires --position-size-fraction"
+        )
+
+    if not args.portfolio_symbol:
+        return
+    symbols = [args.symbol, *args.portfolio_symbol]
+    normalized = [symbol.upper() for symbol in symbols]
+    if len(normalized) != len(set(normalized)):
+        parser.error("portfolio symbols must be unique")
+    if args.strategy == "all":
+        parser.error(
+            "portfolio mode requires one explicit --strategy; "
+            "strategy aggregation is not supported"
+        )
+    if args.position_size_fraction is None:
+        parser.error(
+            "portfolio mode requires --position-size-fraction for explicit "
+            "shared-capital allocation"
+        )
+
+
+def _create_backtest_position_sizer(
+    args: argparse.Namespace,
+) -> PositionSizer | None:
+    """Map opt-in CLI allocation flags to existing sizing policies."""
+    if args.position_sell_fraction is not None:
+        return FixedFractionScaleSizer(
+            buy_fraction=args.position_size_fraction,
+            sell_fraction=args.position_sell_fraction,
+        )
+    if args.position_size_fraction is not None:
+        return FixedFractionPositionSizer(args.position_size_fraction)
+    return None
+
+
+def _load_backtest_rows(
+    repository: SQLiteRepository,
+    *,
+    symbol: str,
+    interval: str,
+    start_time: int,
+    end_time: int,
+    exchange: str,
+) -> tuple[FeatureRow, ...]:
+    """Validate one instrument fully before constructing its features."""
+    quality_report = DataQualityChecker(repository).check(
+        symbol=symbol,
+        interval=interval,
+        start_time=start_time,
+        end_time=end_time,
+        as_of_time=end_time,
+        **_market_identity_kwargs(exchange),
+    )
+    if not quality_report.is_valid:
+        issues: list[str] = []
+        if quality_report.missing_candles:
+            issues.append(
+                f"{quality_report.missing_candles} candles are missing"
+            )
+        if quality_report.unexpected_candles:
+            issues.append(
+                f"{quality_report.unexpected_candles} candles are unexpected"
+            )
+        if quality_report.duplicate_candles:
+            issues.append(
+                f"{quality_report.duplicate_candles} candles are duplicated"
+            )
+        if quality_report.invalid_candles:
+            issues.append(
+                f"{quality_report.invalid_candles} candles are invalid"
+            )
+        if quality_report.actual_candles != quality_report.expected_candles:
+            issues.append(
+                "actual candle count differs from expected count "
+                f"({quality_report.actual_candles} != "
+                f"{quality_report.expected_candles})"
+            )
+        raise ValueError(
+            f"Cannot backtest invalid historical data for {symbol}: "
+            + "; ".join(issues)
+        )
+
+    candles = repository.get_candles_by_range(
+        symbol,
+        interval,
+        start_time,
+        end_time,
+        **_market_identity_kwargs(exchange),
+    )
+    return tuple(FeatureBuilder().build(
+        candles,
+        interval=interval,
+        as_of_time=end_time,
+    ))
 
 
 def _create_strategies(strategy_name: str) -> list[Strategy]:
