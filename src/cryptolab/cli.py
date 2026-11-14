@@ -9,7 +9,11 @@ from pathlib import Path
 
 from cryptolab.analytics.analyzer import MarketAnalyzer
 from cryptolab.analytics.formatter import format_market_report
-from cryptolab.backtesting import BacktestConfig, BacktestEngine
+from cryptolab.backtesting import (
+    BacktestConfig,
+    BacktestEngine,
+    FixedFractionPositionSizer,
+)
 from cryptolab.backtesting.formatter import format_backtest_report
 from cryptolab.features.builder import FeatureBuilder
 from cryptolab.market_data.bybit_client import BybitSpotClient
@@ -409,10 +413,18 @@ def _run_backtest(
             interval=args.interval,
             as_of_time=end_time,
         )
-        engine = BacktestEngine(BacktestConfig(
-            fee_rate=args.fee_rate,
-            trailing_stop_rate=args.trailing_stop_rate,
-        ))
+        position_sizer = (
+            None
+            if args.position_size_fraction is None
+            else FixedFractionPositionSizer(args.position_size_fraction)
+        )
+        engine = BacktestEngine(
+            BacktestConfig(
+                fee_rate=args.fee_rate,
+                trailing_stop_rate=args.trailing_stop_rate,
+            ),
+            position_sizer=position_sizer,
+        )
         reports = [
             engine.run(
                 strategy,
@@ -586,6 +598,16 @@ def _create_parser() -> argparse.ArgumentParser:
         metavar="DECIMAL",
         help="optional trailing-stop fraction, for example 0.05 = 5%%",
     )
+    backtest_parser.add_argument(
+        "--position-size-fraction",
+        type=_parse_position_size_fraction,
+        default=None,
+        metavar="DECIMAL",
+        help=(
+            "fraction of available quote cash allocated to each BUY; "
+            "default preserves all-in allocation"
+        ),
+    )
 
     research_parser = subparsers.add_parser(
         "research",
@@ -705,6 +727,21 @@ def _parse_positive_decimal_rate(value: str) -> Decimal:
     if result == 0:
         raise argparse.ArgumentTypeError(
             "rate must be between 0 and 1"
+        )
+    return result
+
+
+def _parse_position_size_fraction(value: str) -> Decimal:
+    """Parse a finite allocation fraction in the range (0, 1]."""
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid position size fraction: {value!r}"
+        ) from error
+    if not result.is_finite() or not Decimal("0") < result <= 1:
+        raise argparse.ArgumentTypeError(
+            "position size fraction must be between 0 and 1 inclusive"
         )
     return result
 

@@ -8,6 +8,7 @@ from cryptolab.backtesting.models import (
     SimulatedFill,
     TrailingStopFill,
 )
+from cryptolab.backtesting.sizing import LEGACY_SIZER_NAME
 from cryptolab.strategies.models import Signal
 
 
@@ -27,6 +28,10 @@ def format_backtest_report(
         f"Fee per fill:     {report.config.fee_rate * 100:.4f}%",
         f"Adverse slippage: {report.config.slippage_rate * 100:.4f}%",
     ]
+    if report.position_sizer_name != LEGACY_SIZER_NAME:
+        execution_model.append(
+            f"Position sizing:  {report.position_sizer_name}"
+        )
     if report.config.trailing_stop_rate is not None:
         execution_model.append(
             "Trailing stop:    "
@@ -95,8 +100,14 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
     for index, trade in enumerate(report.completed_trades, start=1):
         entry = trade.entry_fill
         exit_fill = trade.exit_fill
-        entry_cost = entry.quote_notional + entry.fee
+        entry_cost = trade.allocated_entry_cost
         return_percentage = trade.pnl / entry_cost * 100
+        entry_fee = trade.entry_fee if trade.entry_fee is not None else entry.fee
+        exit_fee = (
+            trade.exit_fee
+            if trade.exit_fee is not None
+            else exit_fill.fee
+        )
         if isinstance(exit_fill, SimulatedFill):
             exit_details = [
                 (
@@ -133,10 +144,10 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
                 f"{entry.execution_price} USDT, "
                 f"exit={exit_fill.execution_price} USDT"
             ),
-            f"  {base_asset} quantity: {entry.base_quantity}",
+            f"  {base_asset} quantity: {trade.closed_quantity}",
             (
                 "  Fees: entry="
-                f"{entry.fee} USDT, exit={exit_fill.fee} USDT"
+                f"{entry_fee} USDT, exit={exit_fee} USDT"
             ),
             (
                 f"  Net PnL: {trade.pnl:.8f} USDT "
@@ -145,20 +156,38 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
         ])
 
     if report.final_state.base_balance > 0:
-        entry = next(
-            fill for fill in reversed(report.fills)
-            if fill.side is Signal.BUY
-        )
         mark_price = report.equity_curve[-1].close_price
+        open_lots = report.open_lots
+        if len(open_lots) <= 1:
+            entry = next(
+                fill for fill in reversed(report.fills)
+                if fill.side is Signal.BUY
+            )
+            lines.extend([
+                "",
+                "Remaining open position",
+                (
+                    "  Entry signal available/execution: "
+                    f"{_format_timestamp(entry.signal_available_time)} / "
+                    f"{_format_timestamp(entry.execution_open_time)}"
+                ),
+                f"  Entry price: {entry.execution_price} USDT",
+            ])
+        else:
+            average_cost = (
+                report.final_state.entry_cost
+                / report.final_state.base_balance
+            )
+            lines.extend([
+                "",
+                "Remaining open position",
+                f"  Open FIFO lots: {len(open_lots)}",
+                (
+                    "  Average cost including entry fees: "
+                    f"{average_cost} USDT"
+                ),
+            ])
         lines.extend([
-            "",
-            "Remaining open position",
-            (
-                "  Entry signal available/execution: "
-                f"{_format_timestamp(entry.signal_available_time)} / "
-                f"{_format_timestamp(entry.execution_open_time)}"
-            ),
-            f"  Entry price: {entry.execution_price} USDT",
             f"  Entry cost: {report.final_state.entry_cost} USDT",
             f"  {base_asset} quantity: {report.final_state.base_balance}",
             f"  Mark price: {mark_price} USDT (last candle close)",

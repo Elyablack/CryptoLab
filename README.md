@@ -191,9 +191,27 @@ exit an existing long exposure; it never opens a short position.
 ## Backtesting assumptions
 
 Each selected strategy receives an independent virtual portfolio starting with
-1000 USDT. BUY is all-in while flat; SELL is all-out while holding. Decisions
-formed at a candle close execute at the next candle open. Defaults are 0.1% fee
-per fill and 0.05% deterministic adverse slippage.
+1000 USDT. By default BUY is all-in while flat and SELL is all-out while
+holding. Decisions formed at a candle close execute at the next candle open.
+Defaults are 0.1% fee per fill and 0.05% deterministic adverse slippage.
+
+CLI position sizing can allocate a fixed fraction of available quote cash to
+each permitted BUY while retaining the legacy single-entry, all-out SELL mode:
+
+```bash
+cryptolab backtest ... --position-size-fraction 0.25 --show-trades
+```
+
+The strategy still emits quantity-free research signals. At the next candle
+open a `PositionSizer` calculates the allocation. The execution path records
+typed `OrderIntent`, `Order`, and `Fill` audit objects and applies the fill to
+FIFO `PositionLot` accounting. These objects never submit an exchange order.
+
+The Python API also provides `FixedFractionScaleSizer` for scale-in/scale-out
+research and `BacktestEngine.run_portfolio()` for aligned multi-symbol streams
+sharing one USDT balance. Simultaneous events use a stable instrument order,
+making capital allocation deterministic. `PositionCycle` and
+`LotRealization` preserve flat-to-flat and FIFO audit history.
 
 An optional research trailing stop is enabled with, for example:
 
@@ -213,9 +231,25 @@ Further model limitations:
 - fixed slippage is not an order-book simulation;
 - open positions are marked at the final close without hypothetical exit fee;
 - drawdown uses candle-close equity, not intrabar lows;
-- lot size, tick size, minimum notional, partial fills, funding, leverage, and
-  liquidation are not modeled;
+- lot size, tick size, minimum notional, funding, leverage, and liquidation
+  are not modeled by the backtest price model;
+- the order lifecycle supports partial venue fills for offline adapter tests,
+  while a candle backtest still creates one immediate fill per intent;
+- multi-symbol backtests currently require identical candle timelines and are
+  available through the Python API rather than the CLI;
 - fees and slippage are assumptions, not account-specific exchange rates.
+
+## Offline execution adapter
+
+`ExecutionAdapter` is a venue-neutral contract for future paper/testnet work.
+`SimulatedExecutionAdapter` and `FakeVenueExecutionAdapter` are local-only:
+they use no network, credentials, or private exchange API. They support order
+reservations, partial fills, cancellation/rejection/expiration, idempotent
+fill events, reconciliation reports, and immutable restart snapshots.
+
+There is no Binance/Bybit authenticated adapter and no command that submits a
+real or testnet order. Connecting a real venue requires a separate security
+review, credential boundary, exchange-filter handling, and operational design.
 
 ## Testing, build, and CI
 

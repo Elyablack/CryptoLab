@@ -74,6 +74,7 @@ def test_backtest_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--fee-rate" in output
     assert "--show-trades" in output
     assert "--trailing-stop-rate" in output
+    assert "--position-size-fraction" in output
     assert "no exchange orders are created" in " ".join(output.split())
 
 
@@ -166,6 +167,30 @@ def test_backtest_accepts_optional_trailing_stop_rate(
     assert "Trailing exits:   0" in output
 
 
+def test_backtest_accepts_position_size_fraction(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "market_data.db"
+    save_bybit_candles(database_path, make_hourly_candles(72))
+    arguments = backtest_arguments(database_path)
+    arguments.extend([
+        "--strategy",
+        "trend",
+        "--position-size-fraction",
+        "0.25",
+    ])
+
+    exit_code = main(arguments)
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert (
+        "Position sizing:  fixed_fraction(buy_fraction=0.25)"
+        in output
+    )
+
+
 def test_backtest_rejects_incomplete_selected_exchange(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -237,6 +262,33 @@ def test_backtest_rejects_invalid_trailing_stop_rate(
             "2024-01-04",
             "--trailing-stop-rate",
             trailing_stop_rate,
+        ])
+
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "fraction",
+    ["invalid", "0", "-0.1", "1.1", "NaN", "Infinity"],
+)
+def test_backtest_rejects_invalid_position_size_fraction(
+    fraction: str,
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        main([
+            "backtest",
+            "--exchange",
+            "bybit",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "1h",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-04",
+            "--position-size-fraction",
+            fraction,
         ])
 
     assert error.value.code == 2

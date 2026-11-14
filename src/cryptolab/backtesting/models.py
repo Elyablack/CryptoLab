@@ -4,6 +4,17 @@ from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 
+from cryptolab.backtesting.accounting import (
+    LotRealization,
+    PositionCycle,
+    PositionLot,
+)
+from cryptolab.execution.models import (
+    Fill as ExecutionFill,
+    Instrument,
+    Order,
+    OrderIntent,
+)
 from cryptolab.strategies.models import Signal, StrategyDecision
 
 
@@ -67,6 +78,9 @@ class SimulatedFill:
     fee: Decimal
     quote_balance_after: Decimal
     base_balance_after: Decimal
+    intent_id: str | None = None
+    fill_id: str | None = None
+    instrument: Instrument | None = None
 
 
 class TrailingStopTriggerKind(str, Enum):
@@ -91,6 +105,9 @@ class TrailingStopFill:
     fee: Decimal
     quote_balance_after: Decimal
     base_balance_after: Decimal
+    fill_id: str | None = None
+    instrument: Instrument | None = None
+    intent_id: str | None = None
 
     @property
     def side(self) -> Signal:
@@ -102,11 +119,31 @@ Fill = SimulatedFill | TrailingStopFill
 
 @dataclass(frozen=True)
 class CompletedTrade:
-    """One completed long trade from BUY fill through SELL fill."""
+    """One realized FIFO lot portion, or one legacy round trip.
+
+    The optional allocation fields preserve the original public constructor
+    while allowing a partial exit to report only the consumed quantity and
+    its allocated entry cost/proceeds.
+    """
 
     entry_fill: SimulatedFill
     exit_fill: Fill
     pnl: Decimal
+    quantity: Decimal | None = None
+    entry_cost: Decimal | None = None
+    exit_net_proceeds: Decimal | None = None
+    entry_fee: Decimal | None = None
+    exit_fee: Decimal | None = None
+
+    @property
+    def closed_quantity(self) -> Decimal:
+        return self.quantity or self.entry_fill.base_quantity
+
+    @property
+    def allocated_entry_cost(self) -> Decimal:
+        return self.entry_cost or (
+            self.entry_fill.quote_notional + self.entry_fill.fee
+        )
 
 
 @dataclass(frozen=True)
@@ -153,6 +190,13 @@ class BacktestReport:
     completed_trades: tuple[CompletedTrade, ...]
     skipped_decisions: tuple[SkippedDecision, ...]
     equity_curve: tuple[EquityPoint, ...]
+    position_sizer_name: str = "legacy_all_in_all_out"
+    order_intents: tuple[OrderIntent, ...] = ()
+    open_lots: tuple[PositionLot, ...] = ()
+    lot_realizations: tuple[LotRealization, ...] = ()
+    position_cycles: tuple[PositionCycle, ...] = ()
+    orders: tuple[Order, ...] = ()
+    execution_fills: tuple[ExecutionFill, ...] = ()
 
     @property
     def total_return(self) -> Decimal:

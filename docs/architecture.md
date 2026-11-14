@@ -4,7 +4,8 @@
 
 CryptoLab is one local Python CLI application for historical public Spot market
 research. It contains no authenticated API, real order execution, portfolio
-service, scheduler, web service, queue, or background worker.
+daemon, scheduler, web service, queue, or background worker. Execution-domain
+objects and offline adapters are simulations only.
 
 Supported sources are Binance Spot and Bybit V5 Spot. Supported intervals are
 `1m`, `5m`, `15m`, `1h`, `4h`, and `1d`. All ranges are UTC and half-open.
@@ -18,6 +19,10 @@ CLI
 ├── analyze ── quality ── MarketAnalyzer ── indicators/returns
 ├── signals ── quality ── FeatureBuilder ── StrategyRunner
 ├── backtest ─ quality ── FeatureBuilder ── BacktestEngine/formatter
+│                                      ├── PositionSizer
+│                                      ├── OrderIntent → Order → Fill
+│                                      ├── FIFO PortfolioAccounting
+│                                      └── optional trailing stop
 └── research ─ quality ── StrategyResearchRunner
                          ├── three independent BacktestEngine runs
                          ├── buy-and-hold and cash-only
@@ -58,11 +63,32 @@ access to exchange clients or portfolio state.
 
 ### Backtesting
 
-`BacktestEngine` evaluates one strategy and one independent virtual long-only
-portfolio. It executes signals at the next open, applies Decimal fees and
-slippage, retains an equity curve, and asserts accounting invariants. Optional
-trailing-stop fills share the normal SELL settlement path but carry separate
-audit metadata rather than fabricated strategy timestamps.
+`BacktestEngine.run()` evaluates one strategy and one independent virtual
+long-only portfolio. `run_portfolio()` evaluates aligned instrument streams
+against a shared quote balance. It executes signals at the next open, applies
+Decimal fees and slippage, retains an equity curve, and asserts accounting
+invariants. Optional trailing-stop fills share the normal SELL settlement path
+and use risk-source intents without fabricated strategy timestamps.
+
+Strategy decisions remain quantity-free. At an eligible next-open event a
+`PositionSizer` approves either a quote budget for BUY or a base quantity for
+SELL. The default `LegacyAllInAllOutSizer` reproduces the original behavior;
+`FixedFractionPositionSizer` can retain part of the quote cash. An approved
+strategy action becomes an immutable `OrderIntent` with deterministic source
+and intent identifiers. `FixedFractionScaleSizer` enables explicit partial
+allocation without changing StrategyDecision.
+
+`PortfolioAccounting` owns FIFO lots, partial realizations, fees, cost basis,
+position cycles, and realized/unrealized reconciliation. Scale-in adds a lot;
+scale-out consumes lots oldest first. The legacy sizer still rejects repeated
+BUY while holding and closes the full position, preserving original results.
+
+`OrderLifecycle` owns order status transitions and balance reservations. One
+order may receive multiple unique fills but cannot overfill. Duplicate fill
+events are idempotent only when their payload is identical. The backtest uses
+`SimulatedExecutionAdapter`, which immediately fills an intent at the modeled
+price. `FakeVenueExecutionAdapter` adds offline external-event simulation,
+restart snapshots, and state reconciliation. Neither adapter performs I/O.
 
 ### Research
 
@@ -164,6 +190,12 @@ state if any migration step fails.
 - Breakout thresholds exclude the current candle.
 - Strategy histories are read-only prefix views.
 - Decisions are available after close and execute at the next open.
+- Position sizing uses the portfolio and open price observable at that
+  execution event, never the candle's future high, low, or close.
+- Backtest intents map one-to-one to filled simulated orders.
+- One fill ID is processed at most once; conflicting duplicates fail loudly.
+- FIFO lot quantity, remaining cost, fees, and realizations reconcile after
+  every accounting event.
 - Trailing high updates only after the current candle stop check.
 
 ## Operational model
@@ -186,8 +218,9 @@ static checks, dependency audit, and secret scanning.
 - constrained dependencies and automated audit;
 - runtime `.env`, database, and report artifacts excluded from source.
 
-Adding live execution requires a separate architecture and security project; it
-is not an extension point of the current Strategy Engine.
+The offline `ExecutionAdapter` is only a contract boundary. Adding live
+execution still requires a separate architecture and security project; no
+current implementation authenticates or communicates with a trading endpoint.
 
 ## Known limitations
 
@@ -196,4 +229,6 @@ is not an extension point of the current Strategy Engine.
 - no multi-writer SQLite coordination;
 - no scheduler or monitoring service;
 - no machine-readable CLI output yet;
+- no authenticated paper/testnet/live venue adapter or durable order store;
+- multi-symbol backtests require aligned timelines and have no CLI command;
 - backtests do not model order books or exchange quantity filters.
