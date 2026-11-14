@@ -396,6 +396,19 @@ after observing the result. See
 [Trend Pullback v1 research](docs/trend-pullback-v1.md) for the exact rules,
 period results, and limitations.
 
+A bounded follow-up compares only the baseline exit, a predeclared 72-candle
+time exit, and a long-term SMA50 trend exit. It uses the existing engine and
+chronological research split rather than an additional optimizer:
+
+```bash
+python scripts/research_pullback_exits.py \
+  --database data/market_data.db
+```
+
+The iteration returned `NO CANDIDATE`: neither alternative passed the
+Development and Validation gates. See
+[Trading Edge Discovery — Iteration 1](docs/trading-edge-iteration-1.md).
+
 Further model limitations:
 
 - next-open execution is idealized;
@@ -465,5 +478,6 @@ See [architecture](docs/architecture.md),
 [strategy optimization](docs/strategy-optimization.md),
 [signal event study](docs/signal-event-study.md),
 [Trend Pullback v1 research](docs/trend-pullback-v1.md),
+[Trading Edge Discovery — Iteration 1](docs/trading-edge-iteration-1.md),
 [ADR 0001](docs/decisions/0001-initial-architecture.md), and
 [ADR 0002](docs/decisions/0002-data-integrity-and-release.md).

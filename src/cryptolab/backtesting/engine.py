@@ -19,6 +19,7 @@ from cryptolab.backtesting.models import (
     ProtectiveStopTriggerKind,
     SimulatedFill,
     SkippedDecision,
+    TimedExitFill,
     TrailingStopFill,
     TrailingStopTriggerKind,
 )
@@ -73,6 +74,13 @@ class _ProtectiveStopState:
     entry_execution_price: Decimal
 
 
+@dataclass(frozen=True)
+class _TimedExitState:
+    """Actual entry event used to schedule a position-level time exit."""
+
+    entry_execution_open_time: int
+
+
 class BacktestEngine:
     """Evaluate one strategy with one independent virtual Spot portfolio."""
 
@@ -95,6 +103,13 @@ class BacktestEngine:
         ):
             raise ValueError(
                 "stop_loss_rate does not support scale-in position sizing"
+            )
+        if (
+            self._config.max_holding_candles is not None
+            and getattr(self._position_sizer, "allows_scale_in", False)
+        ):
+            raise ValueError(
+                "max_holding_candles does not support scale-in position sizing"
             )
 
     def run(
@@ -152,6 +167,7 @@ class BacktestEngine:
         fills_by_id: dict[str, SimulatedFill] = {}
         trailing_stop_state: _TrailingStopState | None = None
         protective_stop_state: _ProtectiveStopState | None = None
+        timed_exit_state: _TimedExitState | None = None
 
         for index, row in enumerate(eligible_rows):
             if index > 0:
@@ -200,12 +216,53 @@ class BacktestEngine:
                             protective_stop_state = _ProtectiveStopState(
                                 entry_execution_price=fill.execution_price,
                             )
+                        if self._config.max_holding_candles is not None:
+                            if timed_exit_state is not None:
+                                raise RuntimeError(
+                                    "Timed exit already has an entry state"
+                                )
+                            timed_exit_state = _TimedExitState(
+                                entry_execution_open_time=(
+                                    fill.execution_open_time
+                                ),
+                            )
                     elif state.base_balance == 0:
                         trailing_stop_state = None
                         protective_stop_state = None
+                        timed_exit_state = None
                 trades.extend(new_trades)
                 if skip is not None:
                     skipped.append(skip)
+
+            if (
+                self._config.max_holding_candles is not None
+                and state.base_balance > 0
+            ):
+                if timed_exit_state is None:
+                    raise RuntimeError("Open position has no timed-exit state")
+                timed_result = self._execute_timed_exit(
+                    row,
+                    state,
+                    timed_exit_state,
+                    instrument,
+                    accounting,
+                    fills_by_id,
+                    lifecycle,
+                )
+                if timed_result is not None:
+                    state, timed_fill, timed_trades, timed_intent = timed_result
+                    if timed_intent.intent_id in intent_ids:
+                        raise RuntimeError("Duplicate timed-exit intent")
+                    if timed_intent.source_event_id in source_event_ids:
+                        raise RuntimeError("Duplicate timed-exit source event")
+                    intent_ids.add(timed_intent.intent_id)
+                    source_event_ids.add(timed_intent.source_event_id)
+                    order_intents.append(timed_intent)
+                    fills.append(timed_fill)
+                    trades.extend(timed_trades)
+                    timed_exit_state = None
+                    trailing_stop_state = None
+                    protective_stop_state = None
 
             if (
                 self._config.trailing_stop_rate is not None
@@ -234,6 +291,8 @@ class BacktestEngine:
                     fills.append(stop_fill)
                     trades.extend(stop_trades)
                     trailing_stop_state = None
+                    protective_stop_state = None
+                    timed_exit_state = None
                 else:
                     trailing_stop_state = _TrailingStopState(
                         high_watermark=max(
@@ -273,6 +332,8 @@ class BacktestEngine:
                     fills.append(stop_fill)
                     trades.extend(stop_trades)
                     protective_stop_state = None
+                    trailing_stop_state = None
+                    timed_exit_state = None
 
             equity_curve.append(self._mark_equity(row, state))
 
@@ -425,6 +486,7 @@ class BacktestEngine:
         fills_by_id: dict[str, SimulatedFill] = {}
         trailing_states: dict[Instrument, _TrailingStopState] = {}
         protective_states: dict[Instrument, _ProtectiveStopState] = {}
+        timed_exit_states: dict[Instrument, _TimedExitState] = {}
         equity_curve: list[PortfolioEquityPoint] = []
 
         for index in range(len(reference_timeline)):
@@ -488,12 +550,59 @@ class BacktestEngine:
                                         ),
                                     )
                                 )
+                            if self._config.max_holding_candles is not None:
+                                if instrument in timed_exit_states:
+                                    raise RuntimeError(
+                                        "Timed exit already has entry state"
+                                    )
+                                timed_exit_states[instrument] = _TimedExitState(
+                                    entry_execution_open_time=(
+                                        fill.execution_open_time
+                                    ),
+                                )
                         elif state.base_balance == 0:
                             trailing_states.pop(instrument, None)
                             protective_states.pop(instrument, None)
+                            timed_exit_states.pop(instrument, None)
                     trades.extend(new_trades)
                     if skip is not None:
                         skipped.append(skip)
+
+            if self._config.max_holding_candles is not None:
+                for _, _, instrument, _, _ in prepared:
+                    state = self._portfolio_state(accounting, instrument)
+                    if state.base_balance == 0:
+                        continue
+                    timed_state = timed_exit_states.get(instrument)
+                    if timed_state is None:
+                        raise RuntimeError(
+                            "Open position has no timed-exit state"
+                        )
+                    row = current_rows[instrument]
+                    timed_result = self._execute_timed_exit(
+                        row,
+                        state,
+                        timed_state,
+                        instrument,
+                        accounting,
+                        fills_by_id,
+                        lifecycle,
+                    )
+                    if timed_result is None:
+                        continue
+                    _, timed_fill, timed_trades, timed_intent = timed_result
+                    if timed_intent.intent_id in intent_ids:
+                        raise RuntimeError("Duplicate timed-exit intent")
+                    if timed_intent.source_event_id in source_event_ids:
+                        raise RuntimeError("Duplicate timed-exit source event")
+                    intent_ids.add(timed_intent.intent_id)
+                    source_event_ids.add(timed_intent.source_event_id)
+                    intents.append(timed_intent)
+                    fills.append(timed_fill)
+                    trades.extend(timed_trades)
+                    del timed_exit_states[instrument]
+                    trailing_states.pop(instrument, None)
+                    protective_states.pop(instrument, None)
 
             if self._config.trailing_stop_rate is not None:
                 for _, _, instrument, _, _ in prepared:
@@ -525,6 +634,8 @@ class BacktestEngine:
                         fills.append(stop_fill)
                         trades.extend(stop_trades)
                         del trailing_states[instrument]
+                        protective_states.pop(instrument, None)
+                        timed_exit_states.pop(instrument, None)
                     else:
                         trailing_states[instrument] = _TrailingStopState(
                             high_watermark=max(
@@ -568,6 +679,8 @@ class BacktestEngine:
                     fills.append(stop_fill)
                     trades.extend(stop_trades)
                     del protective_states[instrument]
+                    trailing_states.pop(instrument, None)
+                    timed_exit_states.pop(instrument, None)
 
             mark_prices = {
                 instrument: row.close
@@ -847,6 +960,55 @@ class BacktestEngine:
             raise RuntimeError("Strategy SELL produced a non-strategy fill")
         return new_state, fill, trades, None, intent
 
+    def _execute_timed_exit(
+        self,
+        row: FeatureRow,
+        state: PortfolioState,
+        timed_state: _TimedExitState,
+        instrument: Instrument,
+        accounting: PortfolioAccounting,
+        fills_by_id: dict[str, SimulatedFill],
+        lifecycle: ExecutionAdapter,
+    ) -> tuple[
+        PortfolioState,
+        TimedExitFill,
+        tuple[CompletedTrade, ...],
+        OrderIntent,
+    ] | None:
+        maximum = self._config.max_holding_candles
+        if maximum is None:
+            return None
+        interval_milliseconds = row.close_time - row.open_time + 1
+        elapsed = row.open_time - timed_state.entry_execution_open_time
+        if elapsed < maximum * interval_milliseconds:
+            return None
+
+        intent = self._timed_exit_intent(
+            instrument,
+            row,
+            state.base_balance,
+            timed_state,
+            maximum,
+        )
+        new_state, fill, trades = self._settle_sell(
+            row=row,
+            state=state,
+            instrument=instrument,
+            accounting=accounting,
+            fills_by_id=fills_by_id,
+            lifecycle=lifecycle,
+            base_quantity=state.base_balance,
+            market_reference_price=row.open,
+            intent=intent,
+            timed_state=timed_state,
+            maximum_holding_candles=maximum,
+        )
+        if not isinstance(fill, TimedExitFill):
+            raise RuntimeError("Timed exit produced an unexpected fill")
+        if fill.intent_id is None:
+            raise RuntimeError("Timed exit fill has no order intent")
+        return new_state, fill, trades, intent
+
     def _execute_trailing_stop(
         self,
         row: FeatureRow,
@@ -978,6 +1140,8 @@ class BacktestEngine:
         trigger_kind: TrailingStopTriggerKind | None = None,
         protective_state: _ProtectiveStopState | None = None,
         protective_trigger_kind: ProtectiveStopTriggerKind | None = None,
+        timed_state: _TimedExitState | None = None,
+        maximum_holding_candles: int | None = None,
     ) -> tuple[PortfolioState, Fill, tuple[CompletedTrade, ...]]:
         """Apply one SELL through the shared FIFO accounting path."""
         if intent is None:
@@ -998,7 +1162,16 @@ class BacktestEngine:
                 protective_trigger_kind,
             )
         )
-        if sum((is_strategy_exit, is_trailing_exit, is_protective_exit)) != 1:
+        is_timed_exit = (
+            timed_state is not None
+            and maximum_holding_candles is not None
+        )
+        if sum((
+            is_strategy_exit,
+            is_trailing_exit,
+            is_protective_exit,
+            is_timed_exit,
+        )) != 1:
             raise RuntimeError("SELL must have exactly one execution source")
         if (
             is_trailing_exit
@@ -1007,6 +1180,8 @@ class BacktestEngine:
             raise RuntimeError("Trailing stop requires a trailing-stop intent")
         if is_protective_exit and intent.source is not IntentSource.RISK:
             raise RuntimeError("Protective stop requires a risk intent")
+        if is_timed_exit and intent.source is not IntentSource.RISK:
+            raise RuntimeError("Timed exit requires a risk intent")
 
         execution_price = market_reference_price * (
             Decimal("1") - self._config.slippage_rate
@@ -1070,7 +1245,7 @@ class BacktestEngine:
                 instrument=instrument,
                 intent_id=intent.intent_id,
             )
-        else:
+        elif is_protective_exit:
             if (
                 protective_state is None
                 or active_stop_price is None
@@ -1084,6 +1259,26 @@ class BacktestEngine:
                     protective_state.entry_execution_price
                 ),
                 active_stop_price=active_stop_price,
+                market_reference_price=market_reference_price,
+                execution_price=execution_price,
+                base_quantity=base_quantity,
+                quote_notional=quote_notional,
+                fee=fee,
+                quote_balance_after=new_state.quote_balance,
+                base_balance_after=new_state.base_balance,
+                fill_id=fill_id,
+                instrument=instrument,
+                intent_id=intent.intent_id,
+            )
+        else:
+            if timed_state is None or maximum_holding_candles is None:
+                raise RuntimeError("Timed-exit metadata is incomplete")
+            fill = TimedExitFill(
+                entry_execution_open_time=(
+                    timed_state.entry_execution_open_time
+                ),
+                trigger_candle_open_time=row.open_time,
+                maximum_holding_candles=maximum_holding_candles,
                 market_reference_price=market_reference_price,
                 execution_price=execution_price,
                 base_quantity=base_quantity,
@@ -1352,6 +1547,39 @@ class BacktestEngine:
             explanation=(
                 "fixed entry-relative protective stop closed the remaining "
                 "position"
+            ),
+        )
+
+    @staticmethod
+    def _timed_exit_intent(
+        instrument: Instrument,
+        row: FeatureRow,
+        quantity: Decimal,
+        timed_state: _TimedExitState,
+        maximum_holding_candles: int,
+    ) -> OrderIntent:
+        source_event_id = ":".join((
+            "timed-exit",
+            instrument.exchange,
+            instrument.market_type,
+            instrument.symbol,
+            str(timed_state.entry_execution_open_time),
+            str(row.open_time),
+        ))
+        return OrderIntent(
+            intent_id=f"{source_event_id}:intent",
+            source_event_id=source_event_id,
+            source=IntentSource.RISK,
+            instrument=instrument,
+            side=OrderSide.SELL,
+            quantity=quantity,
+            created_at=row.open_time,
+            earliest_execution_at=row.open_time,
+            signal_available_time=None,
+            source_candle_open_time=row.open_time,
+            explanation=(
+                "maximum holding period closed the remaining position after "
+                f"{maximum_holding_candles} candles"
             ),
         )
 

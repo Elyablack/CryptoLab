@@ -22,6 +22,7 @@ from cryptolab.backtesting.models import (
     ProtectiveStopTriggerKind,
     SimulatedFill,
     SkippedDecision,
+    TimedExitFill,
     TrailingStopFill,
     TrailingStopTriggerKind,
 )
@@ -71,6 +72,7 @@ __all__ = [
     "BuySizingProposal",
     "SellSizingProposal",
     "SkippedDecision",
+    "TimedExitFill",
     "TrailingStopFill",
     "TrailingStopTriggerKind",
     "calculate_benchmarks",

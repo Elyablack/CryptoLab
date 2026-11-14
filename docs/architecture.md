@@ -93,6 +93,14 @@ anchored to the actual entry fill. It checks the current candle open and low,
 so its fill is an OHLC execution-model event rather than a fabricated strategy
 decision. Fixed and trailing stops are mutually exclusive.
 
+An optional `max_holding_candles` limit is also anchored to the actual BUY
+fill. It closes the remaining position at the first eligible candle open via a
+typed `TimedExitFill` and the same SELL/FIFO accounting path. A pending strategy
+SELL has priority. The scheduled open exit has priority over an intrabar stop
+on the same candle. No position is force-closed when the dataset ends before
+the limit. Scale-in is rejected because a multi-lot timer anchor has not been
+defined.
+
 Strategy decisions remain quantity-free. At an eligible next-open event a
 `PositionSizer` approves either a quote budget for BUY or a base quantity for
 SELL. The default `LegacyAllInAllOutSizer` reproduces the original behavior;
@@ -254,6 +262,8 @@ state if any migration step fails.
 - Trailing high updates only after the current candle stop check.
 - An entry-relative fixed stop is active after the BUY fill, including the
   entry candle; strategy SELL at the open has priority over the stop check.
+- Time exits count complete candle intervals from the actual entry open and
+  never infer position state from strategy signals.
 - Optimization ranking never reads holdout metrics; feature rows after a
   period's `end_time` are removed by the existing `as_of_time` boundary.
 - Event-study outcomes never cross a chronological boundary, and future

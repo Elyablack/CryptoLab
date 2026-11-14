@@ -3,11 +3,20 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 from typing import ClassVar
 
 from cryptolab.features.models import FeatureRow
 from cryptolab.strategies.base import make_decision
 from cryptolab.strategies.models import Signal, StrategyDecision
+
+
+class TrendPullbackExitPolicy(str, Enum):
+    """Predeclared exit variants for the bounded pullback study."""
+
+    BASELINE = "baseline"
+    ENTRY_ONLY = "entry_only"
+    LONG_TERM_TREND = "long_term_trend"
 
 
 @dataclass(frozen=True)
@@ -29,6 +38,7 @@ class TrendPullbackStrategy:
     confirmation_rsi_max: Decimal = Decimal("65")
     minimum_relative_volume: Decimal = Decimal("0.8")
     maximum_atr_percent: Decimal = Decimal("0.025")
+    exit_policy: TrendPullbackExitPolicy = TrendPullbackExitPolicy.BASELINE
 
     def __post_init__(self) -> None:
         if type(self.trend_slope_lookback) is not int or (
@@ -55,6 +65,8 @@ class TrendPullbackStrategy:
             raise ValueError("minimum_relative_volume must be non-negative")
         if not Decimal("0") < self.maximum_atr_percent < 1:
             raise ValueError("maximum_atr_percent must be between 0 and 1")
+        if not isinstance(self.exit_policy, TrendPullbackExitPolicy):
+            raise ValueError("exit_policy must be a TrendPullbackExitPolicy")
 
     @property
     def minimum_history(self) -> int:
@@ -107,6 +119,10 @@ class TrendPullbackStrategy:
             and current.close < current.sma50
             and current.sma20 < previous.sma20
         )
+        long_term_trend_broken = (
+            current.close < current.sma50
+            and current.sma20 < current.sma50
+        )
         diagnostics = {
             "close": current.close,
             "ema20": current.ema20,
@@ -119,17 +135,37 @@ class TrendPullbackStrategy:
             "bearish_cross": bearish_cross,
             "price_broke_trend": price_broke_trend,
         }
-        if bearish_cross or price_broke_trend:
+        if self.exit_policy is not TrendPullbackExitPolicy.BASELINE:
+            diagnostics.update({
+                "long_term_trend_broken": long_term_trend_broken,
+                "exit_policy": self.exit_policy.value,
+            })
+        baseline_exit = bearish_cross or price_broke_trend
+        should_sell = (
+            self.exit_policy is TrendPullbackExitPolicy.BASELINE
+            and baseline_exit
+        ) or (
+            self.exit_policy is TrendPullbackExitPolicy.LONG_TERM_TREND
+            and long_term_trend_broken
+        )
+        if should_sell:
+            explanation = (
+                "Long-term SMA50 trend failed; SELL means exit long Spot "
+                "exposure, not open a short"
+                if self.exit_policy
+                is TrendPullbackExitPolicy.LONG_TERM_TREND
+                else (
+                    "Uptrend structure broke; SELL means exit long Spot "
+                    "exposure, not open a short"
+                )
+            )
             return make_decision(
                 strategy_name=self.name,
                 symbol=symbol,
                 interval=interval,
                 row=current,
                 signal=Signal.SELL,
-                explanation=(
-                    "Uptrend structure broke; SELL means exit long Spot "
-                    "exposure, not open a short"
-                ),
+                explanation=explanation,
                 diagnostics=diagnostics,
             )
 

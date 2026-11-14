@@ -8,6 +8,7 @@ from cryptolab.backtesting import (
     BacktestEngine,
     FixedFractionPositionSizer,
     PortfolioBacktestInput,
+    TimedExitFill,
 )
 from cryptolab.features.models import FeatureRow
 from cryptolab.strategies.base import make_decision
@@ -169,3 +170,38 @@ def test_multi_symbol_rejects_duplicate_or_misaligned_streams() -> None:
         engine.run_portfolio([btc, duplicate])
     with pytest.raises(ValueError, match="identical timelines"):
         engine.run_portfolio([btc, misaligned])
+
+
+def test_multi_symbol_timed_exits_share_deterministic_open_order() -> None:
+    engine = BacktestEngine(
+        BacktestConfig(
+            fee_rate=Decimal("0"),
+            slippage_rate=Decimal("0"),
+            max_holding_candles=1,
+        ),
+        position_sizer=FixedFractionPositionSizer(Decimal("0.5")),
+    )
+    signals = [Signal.BUY, Signal.HOLD, Signal.HOLD]
+    btc = PortfolioBacktestInput(
+        strategy=ScriptedStrategy("btc", signals),
+        symbol="BTCUSDT",
+        interval="1h",
+        rows=make_rows(["90", "100", "110"]),
+        exchange="bybit",
+    )
+    eth = PortfolioBacktestInput(
+        strategy=ScriptedStrategy("eth", signals),
+        symbol="ETHUSDT",
+        interval="1h",
+        rows=make_rows(["45", "50", "55"]),
+        exchange="bybit",
+    )
+
+    report = engine.run_portfolio([eth, btc])
+
+    timed = [fill for fill in report.fills if isinstance(fill, TimedExitFill)]
+    assert [fill.instrument.symbol for fill in timed] == [
+        "BTCUSDT",
+        "ETHUSDT",
+    ]
+    assert report.positions == ()

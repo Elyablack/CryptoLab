@@ -11,6 +11,7 @@ from cryptolab.backtesting import (
     ProtectiveStopFill,
     ProtectiveStopTriggerKind,
     SimulatedFill,
+    TimedExitFill,
     TrailingStopFill,
     TrailingStopTriggerKind,
 )
@@ -758,6 +759,152 @@ def test_fixed_stop_rejects_ambiguous_scale_in_accounting() -> None:
         )
 
 
+def test_timed_exit_uses_actual_entry_and_exits_at_limit_open() -> None:
+    rows = make_rows(["100", "101", "102", "105"])
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        max_holding_candles=2,
+    )).run(
+        ScriptedStrategy([
+            Signal.BUY,
+            Signal.HOLD,
+            Signal.HOLD,
+            Signal.HOLD,
+        ]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    timed = report.fills[1]
+    assert isinstance(timed, TimedExitFill)
+    assert timed.entry_execution_open_time == rows[1].open_time
+    assert timed.trigger_candle_open_time == rows[3].open_time
+    assert timed.maximum_holding_candles == 2
+    assert timed.market_reference_price == rows[3].open
+    assert report.completed_trades[0].exit_fill is timed
+    assert report.final_state.base_balance == 0
+
+
+def test_timed_exit_at_open_precedes_intrabar_protective_stop() -> None:
+    rows = make_rows(["100", "100", "105"])
+    rows[1] = replace(rows[1], low=Decimal("98"))
+    rows[2] = replace(rows[2], low=Decimal("90"), high=Decimal("106"))
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        stop_loss_rate=Decimal("0.03"),
+        max_holding_candles=1,
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.HOLD, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    assert isinstance(report.fills[1], TimedExitFill)
+    assert report.fills[1].execution_price == Decimal("105")
+    assert not any(
+        isinstance(fill, ProtectiveStopFill)
+        for fill in report.fills
+    )
+
+
+def test_strategy_sell_precedes_timed_exit_at_same_open() -> None:
+    rows = make_rows(["100", "100", "105"])
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        max_holding_candles=1,
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.SELL, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    assert isinstance(report.fills[1], SimulatedFill)
+    assert not any(isinstance(fill, TimedExitFill) for fill in report.fills)
+
+
+def test_timed_exit_does_not_force_close_before_limit_or_at_end() -> None:
+    rows = make_rows(["100", "100", "101"])
+    report = BacktestEngine(BacktestConfig(
+        max_holding_candles=3,
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.HOLD, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    assert len(report.fills) == 1
+    assert report.final_state.base_balance > 0
+
+
+def test_timed_exit_formatter_and_scale_in_validation() -> None:
+    rows = make_rows(["100", "100", "105"])
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        max_holding_candles=1,
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.HOLD, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    output = format_backtest_report(report, show_trades=True)
+    assert "Maximum holding:  1 candles" in output
+    assert "Timed exits:      1" in output
+    assert "Exit maximum holding period" in output
+
+    with pytest.raises(ValueError, match="max_holding_candles"):
+        BacktestEngine(
+            BacktestConfig(max_holding_candles=2),
+            position_sizer=FixedFractionScaleSizer(
+                buy_fraction=Decimal("0.5"),
+                sell_fraction=Decimal("0.5"),
+            ),
+        )
+
+
+def test_protective_stop_resets_timer_before_reentry() -> None:
+    rows = make_rows(["100", "100", "100", "101", "102"])
+    rows[1] = replace(rows[1], low=Decimal("96"), high=Decimal("101"))
+    rows[2] = replace(rows[2], low=Decimal("98"), high=Decimal("101"))
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        stop_loss_rate=Decimal("0.03"),
+        max_holding_candles=2,
+    )).run(
+        ScriptedStrategy([
+            Signal.BUY,
+            Signal.BUY,
+            Signal.HOLD,
+            Signal.HOLD,
+            Signal.HOLD,
+        ]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    assert [type(fill) for fill in report.fills] == [
+        SimulatedFill,
+        ProtectiveStopFill,
+        SimulatedFill,
+        TimedExitFill,
+    ]
+    timed = report.fills[-1]
+    assert isinstance(timed, TimedExitFill)
+    assert timed.entry_execution_open_time == rows[2].open_time
+    assert timed.trigger_candle_open_time == rows[4].open_time
+
+
 class InvalidSignalStrategy:
     name = "invalid_signal"
     minimum_history = 1
@@ -842,6 +989,9 @@ def test_invalid_feature_rows_are_rejected(
         {"stop_loss_rate": Decimal("-0.01")},
         {"stop_loss_rate": Decimal("1")},
         {"stop_loss_rate": Decimal("NaN")},
+        {"max_holding_candles": 0},
+        {"max_holding_candles": -1},
+        {"max_holding_candles": True},
         {
             "trailing_stop_rate": Decimal("0.1"),
             "stop_loss_rate": Decimal("0.03"),

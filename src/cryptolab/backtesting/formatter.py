@@ -13,6 +13,7 @@ from cryptolab.backtesting.models import (
     BacktestReport,
     ProtectiveStopFill,
     SimulatedFill,
+    TimedExitFill,
     TrailingStopFill,
 )
 from cryptolab.backtesting.portfolio import PortfolioBacktestReport
@@ -51,6 +52,11 @@ def format_backtest_report(
             "Protective stop:  "
             f"{report.config.stop_loss_rate * 100:.4f}%"
         )
+    if report.config.max_holding_candles is not None:
+        execution_model.append(
+            "Maximum holding:  "
+            f"{report.config.max_holding_candles} candles"
+        )
 
     activity = [
         f"Fills:            {len(report.fills)}",
@@ -71,6 +77,12 @@ def format_backtest_report(
             for fill in report.fills
         )
         activity.append(f"Protective exits: {protective_exits}")
+    if report.config.max_holding_candles is not None:
+        timed_exits = sum(
+            isinstance(fill, TimedExitFill)
+            for fill in report.fills
+        )
+        activity.append(f"Timed exits:      {timed_exits}")
 
     lines = [
         "CryptoLab Backtest",
@@ -146,6 +158,11 @@ def format_portfolio_backtest_report(
         execution_model.append(
             "Protective stop:  "
             f"{report.config.stop_loss_rate * 100:.4f}%"
+        )
+    if report.config.max_holding_candles is not None:
+        execution_model.append(
+            "Maximum holding:  "
+            f"{report.config.max_holding_candles} candles"
         )
 
     lines = [
@@ -246,6 +263,21 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
                     f"active_stop={exit_fill.active_stop_price} USDT, "
                     "market_reference="
                     f"{exit_fill.market_reference_price} USDT"
+                ),
+            ]
+        elif isinstance(exit_fill, TimedExitFill):
+            exit_details = [
+                (
+                    "  Exit maximum holding period: entry/execution="
+                    f"{_format_timestamp(exit_fill.entry_execution_open_time)}"
+                    " / "
+                    f"{_format_timestamp(exit_fill.trigger_candle_open_time)}"
+                ),
+                (
+                    "  Holding limit: "
+                    f"{exit_fill.maximum_holding_candles} candles, "
+                    f"market_reference={exit_fill.market_reference_price} "
+                    "USDT"
                 ),
             ]
         else:
@@ -361,6 +393,12 @@ def _format_portfolio_trade_details(
         elif isinstance(exit_fill, TrailingStopFill):
             exit_event = (
                 f"trailing {exit_fill.trigger_kind.value}, candle="
+                f"{_format_timestamp(exit_fill.trigger_candle_open_time)}"
+            )
+        elif isinstance(exit_fill, TimedExitFill):
+            exit_event = (
+                f"timed exit after {exit_fill.maximum_holding_candles} "
+                "candles, executed="
                 f"{_format_timestamp(exit_fill.trigger_candle_open_time)}"
             )
         else:

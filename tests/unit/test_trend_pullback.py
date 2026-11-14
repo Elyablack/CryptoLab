@@ -9,7 +9,12 @@ from cryptolab.backtesting import (
     ProtectiveStopFill,
 )
 from cryptolab.features.models import FeatureRow
-from cryptolab.strategies import Signal, StrategyRunner, TrendPullbackStrategy
+from cryptolab.strategies import (
+    Signal,
+    StrategyRunner,
+    TrendPullbackExitPolicy,
+    TrendPullbackStrategy,
+)
 
 
 HOUR = 3_600_000
@@ -119,6 +124,44 @@ def test_trend_break_emits_sell_without_implying_short() -> None:
     assert decision.signal is Signal.SELL
     assert "not open a short" in decision.explanation
     assert decision.diagnostics["price_broke_trend"] is True
+
+
+def test_entry_only_policy_suppresses_strategy_sell() -> None:
+    rows = make_rows()
+    current = rows[-1]
+    rows[-1] = replace(
+        current,
+        close=current.sma50 - 1,
+        high=current.sma50 + 1,
+        low=current.sma50 - 2,
+        sma20=rows[-2].sma20 - 1,
+    )
+
+    decision = TrendPullbackStrategy(
+        exit_policy=TrendPullbackExitPolicy.ENTRY_ONLY,
+    ).evaluate("BTCUSDT", "1h", rows)
+
+    assert decision.signal is Signal.HOLD
+    assert decision.diagnostics["price_broke_trend"] is True
+
+
+def test_long_term_policy_requires_price_and_sma20_below_sma50() -> None:
+    rows = make_rows()
+    current = rows[-1]
+    rows[-1] = replace(
+        current,
+        close=current.sma50 - 1,
+        high=current.sma50 + 1,
+        low=current.sma50 - 2,
+        sma20=current.sma50 - Decimal("0.1"),
+    )
+
+    decision = TrendPullbackStrategy(
+        exit_policy=TrendPullbackExitPolicy.LONG_TERM_TREND,
+    ).evaluate("BTCUSDT", "1h", rows)
+
+    assert decision.signal is Signal.SELL
+    assert decision.diagnostics["long_term_trend_broken"] is True
 
 
 def test_used_pullback_does_not_emit_repeated_buy() -> None:
@@ -240,6 +283,7 @@ def test_buy_executes_next_open_then_fixed_stop_can_trigger_intrabar() -> None:
         {"confirmation_rsi_max": Decimal("101")},
         {"minimum_relative_volume": Decimal("-0.1")},
         {"maximum_atr_percent": Decimal("0")},
+        {"exit_policy": "baseline"},
     ],
 )
 def test_invalid_pullback_parameters_are_rejected(kwargs) -> None:

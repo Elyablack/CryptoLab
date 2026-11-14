@@ -27,6 +27,7 @@ class BacktestConfig:
     slippage_rate: Decimal = Decimal("0.0005")
     trailing_stop_rate: Decimal | None = None
     stop_loss_rate: Decimal | None = None
+    max_holding_candles: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -64,6 +65,11 @@ class BacktestConfig:
             raise ValueError(
                 "trailing_stop_rate and stop_loss_rate cannot be combined"
             )
+        if self.max_holding_candles is not None and (
+            type(self.max_holding_candles) is not int
+            or self.max_holding_candles <= 0
+        ):
+            raise ValueError("max_holding_candles must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -159,7 +165,30 @@ class ProtectiveStopFill:
         return Signal.SELL
 
 
-Fill = SimulatedFill | TrailingStopFill | ProtectiveStopFill
+@dataclass(frozen=True)
+class TimedExitFill:
+    """A scheduled position exit without a fabricated strategy decision."""
+
+    entry_execution_open_time: int
+    trigger_candle_open_time: int
+    maximum_holding_candles: int
+    market_reference_price: Decimal
+    execution_price: Decimal
+    base_quantity: Decimal
+    quote_notional: Decimal
+    fee: Decimal
+    quote_balance_after: Decimal
+    base_balance_after: Decimal
+    fill_id: str | None = None
+    instrument: Instrument | None = None
+    intent_id: str | None = None
+
+    @property
+    def side(self) -> Signal:
+        return Signal.SELL
+
+
+Fill = SimulatedFill | TrailingStopFill | ProtectiveStopFill | TimedExitFill
 
 
 @dataclass(frozen=True)

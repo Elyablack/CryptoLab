@@ -11,7 +11,10 @@ from cryptolab.strategies.trend_following import (
     TrendExitPolicy,
     TrendFollowingStrategy,
 )
-from cryptolab.strategies.trend_pullback import TrendPullbackStrategy
+from cryptolab.strategies.trend_pullback import (
+    TrendPullbackExitPolicy,
+    TrendPullbackStrategy,
+)
 
 __all__ = [
     "BreakoutStrategy",
@@ -22,6 +25,7 @@ __all__ = [
     "StrategyRunner",
     "TrendExitPolicy",
     "TrendFollowingStrategy",
+    "TrendPullbackExitPolicy",
     "TrendPullbackStrategy",
 ]
 
