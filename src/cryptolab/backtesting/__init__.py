@@ -4,7 +4,11 @@ from cryptolab.backtesting.benchmarks import (
     BenchmarkReport,
     calculate_benchmarks,
 )
-from cryptolab.backtesting.engine import BacktestEngine
+from cryptolab.backtesting.engine import (
+    BacktestEngine,
+    BacktestExecutionSession,
+    StrategyExecutionOutcome,
+)
 from cryptolab.backtesting.accounting import (
     LotRealization,
     PortfolioAccounting,
@@ -46,6 +50,7 @@ from cryptolab.backtesting.sizing import (
 __all__ = [
     "BacktestConfig",
     "BacktestEngine",
+    "BacktestExecutionSession",
     "BacktestReport",
     "BenchmarkReport",
     "CompletedTrade",
@@ -72,6 +77,7 @@ __all__ = [
     "BuySizingProposal",
     "SellSizingProposal",
     "SkippedDecision",
+    "StrategyExecutionOutcome",
     "TimedExitFill",
     "TrailingStopFill",
     "TrailingStopTriggerKind",

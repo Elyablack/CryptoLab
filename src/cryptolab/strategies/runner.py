@@ -85,39 +85,85 @@ class StrategyRunner:
         for index, row in enumerate(eligible_rows):
             history = _HistoryView(eligible_rows, range(index + 1))
             for strategy in self._strategies:
-                if len(history) < strategy.minimum_history:
-                    decision = make_decision(
-                        strategy_name=strategy.name,
-                        symbol=symbol,
-                        interval=interval,
-                        row=row,
-                        signal=Signal.HOLD,
-                        explanation=(
-                            "Warm-up: "
-                            f"{len(history)}/{strategy.minimum_history} rows"
-                        ),
-                        diagnostics={
-                            "available_history": len(history),
-                            "required_history": strategy.minimum_history,
-                        },
-                    )
-                else:
-                    decision = strategy.evaluate(
-                        symbol,
-                        interval,
-                        history,
-                    )
-
-                self._validate_decision(
-                    decision,
+                decisions.append(self._evaluate_strategy(
                     strategy,
                     symbol,
                     interval,
+                    history,
                     row,
-                )
-                decisions.append(decision)
+                ))
 
         return decisions
+
+    def evaluate_latest(
+        self,
+        symbol: str,
+        interval: str,
+        rows: Sequence[FeatureRow],
+        *,
+        as_of_time: int | None = None,
+    ) -> list[StrategyDecision]:
+        """Evaluate only the newest available row for incremental replay.
+
+        Earlier rows remain visible through the same read-only history view,
+        but earlier decisions are not evaluated again.
+        """
+        self._validate_rows(interval, rows)
+        eligible_rows = tuple(
+            row
+            for row in rows
+            if as_of_time is None or row.available_time <= as_of_time
+        )
+        if not eligible_rows:
+            raise ValueError("No feature rows are available at as_of_time")
+        row = eligible_rows[-1]
+        history = _HistoryView(eligible_rows, range(len(eligible_rows)))
+        return [
+            self._evaluate_strategy(
+                strategy,
+                symbol,
+                interval,
+                history,
+                row,
+            )
+            for strategy in self._strategies
+        ]
+
+    @staticmethod
+    def _evaluate_strategy(
+        strategy: Strategy,
+        symbol: str,
+        interval: str,
+        history: Sequence[FeatureRow],
+        row: FeatureRow,
+    ) -> StrategyDecision:
+        if len(history) < strategy.minimum_history:
+            decision = make_decision(
+                strategy_name=strategy.name,
+                symbol=symbol,
+                interval=interval,
+                row=row,
+                signal=Signal.HOLD,
+                explanation=(
+                    "Warm-up: "
+                    f"{len(history)}/{strategy.minimum_history} rows"
+                ),
+                diagnostics={
+                    "available_history": len(history),
+                    "required_history": strategy.minimum_history,
+                },
+            )
+        else:
+            decision = strategy.evaluate(symbol, interval, history)
+
+        StrategyRunner._validate_decision(
+            decision,
+            strategy,
+            symbol,
+            interval,
+            row,
+        )
+        return decision
 
     @staticmethod
     def _validate_rows(

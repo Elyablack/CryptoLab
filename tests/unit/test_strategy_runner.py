@@ -161,6 +161,47 @@ def test_runner_as_of_time_excludes_unavailable_rows() -> None:
     assert decisions[-1].candle_open_time == rows[2].open_time
 
 
+def test_evaluate_latest_only_evaluates_newest_available_row() -> None:
+    rows = make_rows(5)
+    strategy = SpyStrategy(minimum_history=2)
+
+    decisions = StrategyRunner([strategy]).evaluate_latest(
+        "BTCUSDT",
+        "1h",
+        rows,
+        as_of_time=rows[3].available_time,
+    )
+
+    assert len(decisions) == 1
+    assert decisions[0].candle_open_time == rows[3].open_time
+    assert strategy.history_lengths == [4]
+
+
+def test_evaluate_latest_preserves_warmup_and_availability_rules() -> None:
+    rows = make_rows(3)
+    strategy = SpyStrategy(minimum_history=3)
+    runner = StrategyRunner([strategy])
+
+    warmup = runner.evaluate_latest(
+        "BTCUSDT",
+        "1h",
+        rows[:2],
+        as_of_time=rows[1].available_time,
+    )
+
+    assert warmup[0].signal is Signal.HOLD
+    assert warmup[0].explanation == "Warm-up: 2/3 rows"
+    assert strategy.history_lengths == []
+
+    with pytest.raises(ValueError, match="No feature rows"):
+        runner.evaluate_latest(
+            "BTCUSDT",
+            "1h",
+            rows,
+            as_of_time=rows[0].open_time,
+        )
+
+
 def test_runner_is_deterministic() -> None:
     rows = make_rows(5)
     runner = StrategyRunner([SpyStrategy()])

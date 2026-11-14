@@ -68,3 +68,17 @@ without silently modifying either side.
 
 These adapters contain no HTTP client, authentication, API keys, or exchange
 order submission. They are not live or testnet trading implementations.
+
+## Incremental historical replay
+
+`BacktestExecutionSession` exposes the normal strategy execution kernel as an
+incremental stateful boundary. `DeterministicReplaySession` owns the historical
+clock and event order, performs sizing followed by the replay risk gate, and
+then delegates accepted decisions to that boundary. It does not copy fee,
+slippage, lifecycle, reservation, or FIFO formulas. The resulting standard
+`BacktestReport` is exactly comparable with `BacktestEngine.run()`.
+
+Stage 1 supports only normal next-open strategy decisions. Stop and timed-exit
+models remain batch-only because they require explicit current-candle path
+events; an incremental session rejects those configurations instead of
+changing their semantics implicitly.

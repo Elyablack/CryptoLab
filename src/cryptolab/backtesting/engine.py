@@ -41,6 +41,7 @@ from cryptolab.execution.models import (
     Fill as ExecutionFill,
     Instrument,
     IntentSource,
+    Order,
     OrderIntent,
     OrderSide,
     OrderStatus,
@@ -81,6 +82,17 @@ class _TimedExitState:
     entry_execution_open_time: int
 
 
+@dataclass(frozen=True)
+class StrategyExecutionOutcome:
+    """One strategy decision processed by the shared execution kernel."""
+
+    state: PortfolioState
+    fill: SimulatedFill | None
+    completed_trades: tuple[CompletedTrade, ...]
+    skipped_decision: SkippedDecision | None
+    order_intent: OrderIntent | None
+
+
 class BacktestEngine:
     """Evaluate one strategy with one independent virtual Spot portfolio."""
 
@@ -111,6 +123,28 @@ class BacktestEngine:
             raise ValueError(
                 "max_holding_candles does not support scale-in position sizing"
             )
+
+    def start_execution_session(
+        self,
+        instrument: Instrument,
+    ) -> "BacktestExecutionSession":
+        """Create an incremental single-instrument strategy execution state.
+
+        Stage 1 replay deliberately supports normal strategy decisions only;
+        candle-path stop models remain owned by the batch backtest loop.
+        """
+        if not isinstance(instrument, Instrument):
+            raise ValueError("instrument must be an Instrument")
+        if any((
+            self._config.trailing_stop_rate is not None,
+            self._config.stop_loss_rate is not None,
+            self._config.max_holding_candles is not None,
+        )):
+            raise ValueError(
+                "Incremental strategy execution does not support stop or "
+                "timed-exit configuration"
+            )
+        return BacktestExecutionSession(self, instrument)
 
     def run(
         self,
@@ -776,6 +810,9 @@ class BacktestEngine:
         accounting: PortfolioAccounting,
         fills_by_id: dict[str, SimulatedFill],
         lifecycle: ExecutionAdapter,
+        approved_sizing: (
+            BuySizingProposal | SellSizingProposal | SizingRejection | None
+        ) = None,
     ) -> tuple[
         PortfolioState,
         SimulatedFill | None,
@@ -787,6 +824,8 @@ class BacktestEngine:
             raise RuntimeError("Signal is not aligned with the next candle open")
 
         if decision.signal is Signal.HOLD:
+            if approved_sizing is not None:
+                raise ValueError("HOLD decision cannot have approved sizing")
             return state, None, (), None, None
 
         if decision.signal is Signal.BUY:
@@ -807,11 +846,15 @@ class BacktestEngine:
                     ),
                     None,
                 )
-            sizing = self._size_decision(
-                decision,
-                execution_row,
-                state,
-                instrument,
+            sizing = (
+                approved_sizing
+                if approved_sizing is not None
+                else self._size_decision(
+                    decision,
+                    execution_row,
+                    state,
+                    instrument,
+                )
             )
             if isinstance(sizing, SizingRejection):
                 return self._sizing_rejection(decision, state, sizing)
@@ -839,11 +882,15 @@ class BacktestEngine:
                     ),
                     None,
                 )
-            sizing = self._size_decision(
-                decision,
-                execution_row,
-                state,
-                instrument,
+            sizing = (
+                approved_sizing
+                if approved_sizing is not None
+                else self._size_decision(
+                    decision,
+                    execution_row,
+                    state,
+                    instrument,
+                )
             )
             if isinstance(sizing, SizingRejection):
                 return self._sizing_rejection(decision, state, sizing)
@@ -1840,3 +1887,263 @@ class BacktestEngine:
             for reservation in lifecycle.reservations
         ):
             raise RuntimeError("Filled backtest order retains a reservation")
+
+
+class BacktestExecutionSession:
+    """Incremental state around the existing strategy execution kernel.
+
+    The session does not implement pricing, fees, reservations, fills, or FIFO
+    accounting. It owns the mutable objects already used by ``BacktestEngine``
+    and delegates every accepted strategy decision to ``_execute_decision``.
+    """
+
+    def __init__(
+        self,
+        engine: BacktestEngine,
+        instrument: Instrument,
+    ) -> None:
+        self._engine = engine
+        self._instrument = instrument
+        self._accounting = PortfolioAccounting(engine._config.initial_cash)
+        self._lifecycle = SimulatedExecutionAdapter()
+        self._fills_by_id: dict[str, SimulatedFill] = {}
+        self._fills: list[SimulatedFill] = []
+        self._trades: list[CompletedTrade] = []
+        self._skipped: list[SkippedDecision] = []
+        self._intents: list[OrderIntent] = []
+        self._intent_ids: set[str] = set()
+        self._source_event_ids: set[str] = set()
+        self._processed_decisions: set[tuple[str, str, str, int, Signal]] = set()
+        self._final_report: BacktestReport | None = None
+
+    @property
+    def instrument(self) -> Instrument:
+        return self._instrument
+
+    @property
+    def state(self) -> PortfolioState:
+        return self._engine._portfolio_state(
+            self._accounting,
+            self._instrument,
+        )
+
+    @property
+    def position_sizer_name(self) -> str:
+        return self._engine._position_sizer.name
+
+    @property
+    def fills(self) -> tuple[SimulatedFill, ...]:
+        return tuple(self._fills)
+
+    @property
+    def completed_trades(self) -> tuple[CompletedTrade, ...]:
+        return tuple(self._trades)
+
+    @property
+    def skipped_decisions(self) -> tuple[SkippedDecision, ...]:
+        return tuple(self._skipped)
+
+    @property
+    def order_intents(self) -> tuple[OrderIntent, ...]:
+        return tuple(self._intents)
+
+    @property
+    def orders(self) -> tuple[Order, ...]:
+        return self._lifecycle.orders
+
+    @property
+    def execution_fills(self) -> tuple[ExecutionFill, ...]:
+        return self._lifecycle.fills
+
+    def prepare_sizing(
+        self,
+        decision: StrategyDecision,
+        execution_row: FeatureRow,
+    ) -> BuySizingProposal | SellSizingProposal | SizingRejection | None:
+        """Calculate the same sizing value the batch engine would use."""
+        self._ensure_active()
+        state = self.state
+        if decision.signal is Signal.HOLD:
+            return None
+        if (
+            decision.signal is Signal.BUY
+            and state.base_balance > 0
+            and not getattr(
+                self._engine._position_sizer,
+                "allows_scale_in",
+                False,
+            )
+        ):
+            return None
+        if decision.signal is Signal.SELL and state.base_balance == 0:
+            return None
+        return self._engine._size_decision(
+            decision,
+            execution_row,
+            state,
+            self._instrument,
+        )
+
+    def execute(
+        self,
+        decision: StrategyDecision,
+        execution_row: FeatureRow,
+        *,
+        approved_sizing: (
+            BuySizingProposal | SellSizingProposal | SizingRejection | None
+        ) = None,
+    ) -> StrategyExecutionOutcome:
+        """Execute one not-previously-processed decision at its next open."""
+        self._ensure_active()
+        key = self._decision_key(decision)
+        if key in self._processed_decisions:
+            raise ValueError("Strategy decision has already been processed")
+        state, fill, trades, skipped, intent = self._engine._execute_decision(
+            decision,
+            execution_row,
+            self.state,
+            self._instrument,
+            self._accounting,
+            self._fills_by_id,
+            self._lifecycle,
+            approved_sizing=approved_sizing,
+        )
+        if intent is not None:
+            if intent.intent_id in self._intent_ids:
+                raise RuntimeError("Duplicate order intent identifier")
+            if intent.source_event_id in self._source_event_ids:
+                raise RuntimeError("One source event produced multiple intents")
+            self._intent_ids.add(intent.intent_id)
+            self._source_event_ids.add(intent.source_event_id)
+            self._intents.append(intent)
+        if fill is not None:
+            if fill.fill_id is None:
+                raise RuntimeError("Strategy fill has no fill identifier")
+            self._fills.append(fill)
+            if fill.side is Signal.BUY:
+                self._fills_by_id[fill.fill_id] = fill
+        self._trades.extend(trades)
+        if skipped is not None:
+            self._skipped.append(skipped)
+        self._processed_decisions.add(key)
+        return StrategyExecutionOutcome(
+            state=state,
+            fill=fill,
+            completed_trades=trades,
+            skipped_decision=skipped,
+            order_intent=intent,
+        )
+
+    def reject(
+        self,
+        decision: StrategyDecision,
+        reason: str,
+    ) -> StrategyExecutionOutcome:
+        """Record a deterministic pre-intent risk rejection."""
+        self._ensure_active()
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("Risk rejection reason must be non-empty")
+        key = self._decision_key(decision)
+        if key in self._processed_decisions:
+            raise ValueError("Strategy decision has already been processed")
+        skipped = SkippedDecision(
+            decision=decision,
+            reason=f"Risk check rejected decision: {reason}",
+        )
+        self._skipped.append(skipped)
+        self._processed_decisions.add(key)
+        return StrategyExecutionOutcome(
+            state=self.state,
+            fill=None,
+            completed_trades=(),
+            skipped_decision=skipped,
+            order_intent=None,
+        )
+
+    def mark_equity(self, row: FeatureRow) -> EquityPoint:
+        self._ensure_active()
+        return self._engine._mark_equity(row, self.state)
+
+    def finalize(
+        self,
+        *,
+        strategy_name: str,
+        symbol: str,
+        interval: str,
+        exchange: str,
+        market_type: str,
+        equity_curve: Sequence[EquityPoint],
+        last_close: Decimal,
+        last_decision: StrategyDecision,
+    ) -> BacktestReport:
+        """Build the standard report and run the standard engine invariants."""
+        if self._final_report is not None:
+            return self._final_report
+        if last_decision.signal is not Signal.HOLD:
+            self._skipped.append(SkippedDecision(
+                decision=last_decision,
+                reason="no next candle is available for execution",
+            ))
+        state = self.state
+        final_equity = self._accounting.equity({
+            self._instrument: last_close,
+        })
+        total_pnl = final_equity - self._engine._config.initial_cash
+        unrealized_pnl = total_pnl - state.realized_pnl
+        self._engine._assert_accounting_invariants(
+            state,
+            self._fills,
+            self._trades,
+            equity_curve,
+            self._intents,
+            self._accounting,
+            self._instrument,
+            self._lifecycle,
+            final_equity,
+            total_pnl,
+            unrealized_pnl,
+        )
+        self._final_report = BacktestReport(
+            strategy_name=strategy_name,
+            exchange=exchange,
+            market_type=market_type,
+            symbol=symbol,
+            interval=interval,
+            config=self._engine._config,
+            final_state=state,
+            final_equity=final_equity,
+            realized_pnl=state.realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            total_pnl=total_pnl,
+            maximum_equity_drawdown=self._engine._maximum_drawdown(
+                equity_curve,
+            ),
+            fills=tuple(self._fills),
+            completed_trades=tuple(self._trades),
+            skipped_decisions=tuple(self._skipped),
+            equity_curve=tuple(equity_curve),
+            position_sizer_name=self.position_sizer_name,
+            order_intents=tuple(self._intents),
+            open_lots=self._accounting.all_lots(),
+            lot_realizations=self._accounting.realizations,
+            position_cycles=self._accounting.cycles,
+            orders=self._lifecycle.orders,
+            execution_fills=self._lifecycle.fills,
+        )
+        return self._final_report
+
+    def _ensure_active(self) -> None:
+        if self._final_report is not None:
+            raise RuntimeError("Execution session is already finalized")
+
+    @staticmethod
+    def _decision_key(
+        decision: StrategyDecision,
+    ) -> tuple[str, str, str, int, Signal]:
+        return (
+            decision.strategy_name,
+            decision.symbol,
+            decision.interval,
+            decision.candle_open_time,
+            decision.signal,
+        )

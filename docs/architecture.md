@@ -131,6 +131,17 @@ events are idempotent only when their payload is identical. The backtest uses
 price. `FakeVenueExecutionAdapter` adds offline external-event simulation,
 restart snapshots, and state reconciliation. Neither adapter performs I/O.
 
+### Deterministic event replay
+
+`DeterministicReplayRunner` and `DeterministicReplaySession` provide an offline
+single-symbol event loop for future paper-bot research. They process one closed
+candle at a time with an explicit monotonic clock, evaluate only the newest
+feature row, and execute the previous decision at the next open. The replay
+uses `BacktestExecutionSession`, a stateful wrapper around the existing
+`BacktestEngine` execution kernel, so sizing, intents, lifecycle transitions,
+fills, FIFO accounting, fees, and PnL are not reimplemented. Replay-specific
+scope and limitations are documented in `docs/paper-bot-stage-1.md`.
+
 ### Research
 
 `StrategyResearchRunner` runs unchanged strategies, deterministic benchmarks,
