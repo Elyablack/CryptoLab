@@ -29,6 +29,12 @@ class ReplayRiskContext:
     instrument: Instrument
     market_open_price: Decimal
     observed_at: int
+    candle_close_time: int | None = None
+    data_received_at: int | None = None
+    reserved_quote: Decimal = Decimal("0")
+    open_order_count: int = 0
+    equity: Decimal | None = None
+    execution_state_known: bool = True
 
 
 @dataclass(frozen=True)

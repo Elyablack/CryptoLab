@@ -33,9 +33,64 @@ class ReplayEventType(str, Enum):
     STRATEGY_DECISION = "strategy_decision"
     PORTFOLIO_SNAPSHOT = "portfolio_snapshot"
     UNEXECUTED_DECISION = "unexecuted_decision"
+    PRICE_OBSERVED = "price_observed"
+    BACKFILL_DECISION_SUPPRESSED = "backfill_decision_suppressed"
+
+
+class ReplayExecutionMode(str, Enum):
+    NEXT_CANDLE_OPEN = "next_candle_open"
+    OBSERVED_AFTER_CLOSE = "observed_after_close"
 
 
 ReplayMetadataValue = str | int | Decimal | bool | None
+
+
+@dataclass(frozen=True)
+class PriceObservation:
+    """Public market price observed by the local process at a real timestamp."""
+
+    price: Decimal
+    observed_at: int
+    source: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.price, Decimal)
+            or not self.price.is_finite()
+            or self.price <= 0
+        ):
+            raise ValueError("Observed price must be a finite positive Decimal")
+        if type(self.observed_at) is not int or self.observed_at < 0:
+            raise ValueError("observed_at must be a non-negative integer")
+        if not isinstance(self.source, str) or not self.source.strip():
+            raise ValueError("Price observation source must be non-empty")
+
+
+@dataclass(frozen=True)
+class ObservedCandleEvent:
+    """Closed candle plus the real local times used by paper execution."""
+
+    candle: Candle
+    received_at: int
+    price_observation: PriceObservation | None
+    trading_enabled: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.candle, Candle):
+            raise ValueError("candle must be a Candle")
+        if type(self.received_at) is not int or (
+            self.received_at <= self.candle.close_time
+        ):
+            raise ValueError("received_at must be after candle close_time")
+        if type(self.trading_enabled) is not bool:
+            raise ValueError("trading_enabled must be a boolean")
+        observation = self.price_observation
+        if observation is not None and (
+            observation.observed_at < self.received_at
+        ):
+            raise ValueError("Price observation cannot predate candle receipt")
+        if self.trading_enabled and observation is None:
+            raise ValueError("Trading requires a price observation")
 
 
 @dataclass(frozen=True)

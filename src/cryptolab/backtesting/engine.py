@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 from cryptolab.backtesting.accounting import (
     LotRealization,
@@ -835,6 +835,10 @@ class BacktestEngine:
         approved_sizing: (
             BuySizingProposal | SellSizingProposal | SizingRejection | None
         ) = None,
+        allow_delayed_execution: bool = False,
+        execution_fill_fraction: Decimal = Decimal("1"),
+        execution_quantity_step: Decimal | None = None,
+        cancel_unfilled_remainder: bool = False,
     ) -> tuple[
         PortfolioState,
         SimulatedFill | None,
@@ -842,8 +846,25 @@ class BacktestEngine:
         SkippedDecision | None,
         OrderIntent | None,
     ]:
-        if decision.signal_available_time != execution_row.open_time:
+        if allow_delayed_execution:
+            if execution_row.open_time < decision.signal_available_time:
+                raise RuntimeError("Decision cannot execute before availability")
+        elif decision.signal_available_time != execution_row.open_time:
             raise RuntimeError("Signal is not aligned with the next candle open")
+        if (
+            not isinstance(execution_fill_fraction, Decimal)
+            or not execution_fill_fraction.is_finite()
+            or not Decimal("0") < execution_fill_fraction <= 1
+        ):
+            raise ValueError("execution_fill_fraction must be in (0, 1]")
+        if execution_quantity_step is not None and (
+            not isinstance(execution_quantity_step, Decimal)
+            or not execution_quantity_step.is_finite()
+            or execution_quantity_step <= 0
+        ):
+            raise ValueError("execution_quantity_step must be positive")
+        if type(cancel_unfilled_remainder) is not bool:
+            raise ValueError("cancel_unfilled_remainder must be a boolean")
 
         if decision.signal is Signal.HOLD:
             if approved_sizing is not None:
@@ -890,6 +911,9 @@ class BacktestEngine:
                 sizing,
                 accounting,
                 lifecycle,
+                execution_fill_fraction=execution_fill_fraction,
+                execution_quantity_step=execution_quantity_step,
+                cancel_unfilled_remainder=cancel_unfilled_remainder,
             )
 
         if decision.signal is Signal.SELL:
@@ -927,6 +951,9 @@ class BacktestEngine:
                 accounting,
                 fills_by_id,
                 lifecycle,
+                execution_fill_fraction=execution_fill_fraction,
+                execution_quantity_step=execution_quantity_step,
+                cancel_unfilled_remainder=cancel_unfilled_remainder,
             )
 
         raise ValueError(f"Unsupported signal value: {decision.signal!r}")
@@ -940,6 +967,10 @@ class BacktestEngine:
         sizing: BuySizingProposal,
         accounting: PortfolioAccounting,
         lifecycle: ExecutionAdapter,
+        *,
+        execution_fill_fraction: Decimal = Decimal("1"),
+        execution_quantity_step: Decimal | None = None,
+        cancel_unfilled_remainder: bool = False,
     ) -> tuple[
         PortfolioState,
         SimulatedFill,
@@ -955,32 +986,59 @@ class BacktestEngine:
         quote_notional = sizing.quote_budget / (
             Decimal("1") + self._config.fee_rate
         )
-        fee = sizing.quote_budget - quote_notional
-        base_quantity = quote_notional / execution_price
+        requested_fee = sizing.quote_budget - quote_notional
+        raw_requested_quantity = quote_notional / execution_price
+        requested_quantity = self._paper_fill_quantity(
+            raw_requested_quantity,
+            Decimal("1"),
+            execution_quantity_step,
+        )
+        base_quantity = self._paper_fill_quantity(
+            requested_quantity,
+            execution_fill_fraction,
+            execution_quantity_step,
+        )
+        if (
+            execution_quantity_step is None
+            and base_quantity == requested_quantity
+        ):
+            fee = requested_fee
+            fill_quote_notional = quote_notional
+            reservation_amount = sizing.quote_budget
+        else:
+            fill_quote_notional = base_quantity * execution_price
+            fee = fill_quote_notional * self._config.fee_rate
+            reservation_amount = (
+                requested_quantity
+                * execution_price
+                * (Decimal("1") + self._config.fee_rate)
+            )
         intent = self._strategy_intent(
             decision,
             row,
             instrument,
-            base_quantity,
+            requested_quantity,
         )
         fill_id = f"{intent.intent_id}:fill:1"
         self._submit_filled_order(
             lifecycle=lifecycle,
             intent=intent,
-            reservation_amount=sizing.quote_budget,
+            reservation_amount=reservation_amount,
             available_balance=state.quote_balance,
             fill_id=fill_id,
             execution_price=execution_price,
-            quote_notional=quote_notional,
+            fill_quantity=base_quantity,
+            quote_notional=fill_quote_notional,
             fee=fee,
             executed_at=row.open_time,
+            cancel_unfilled_remainder=cancel_unfilled_remainder,
         )
         accounting.record_buy(
             fill_id=fill_id,
             instrument=instrument,
             quantity=base_quantity,
             execution_price=execution_price,
-            quote_notional=quote_notional,
+            quote_notional=fill_quote_notional,
             fee=fee,
             executed_at=row.open_time,
         )
@@ -990,7 +1048,7 @@ class BacktestEngine:
             row,
             execution_price,
             base_quantity,
-            quote_notional,
+            fill_quote_notional,
             fee,
             new_state,
             intent,
@@ -1009,6 +1067,10 @@ class BacktestEngine:
         accounting: PortfolioAccounting,
         fills_by_id: dict[str, SimulatedFill],
         lifecycle: ExecutionAdapter,
+        *,
+        execution_fill_fraction: Decimal = Decimal("1"),
+        execution_quantity_step: Decimal | None = None,
+        cancel_unfilled_remainder: bool = False,
     ) -> tuple[
         PortfolioState,
         SimulatedFill,
@@ -1044,6 +1106,9 @@ class BacktestEngine:
             market_reference_price=row.open,
             decision=decision,
             intent=intent,
+            execution_fill_fraction=execution_fill_fraction,
+            execution_quantity_step=execution_quantity_step,
+            cancel_unfilled_remainder=cancel_unfilled_remainder,
         )
         if not isinstance(fill, SimulatedFill):
             raise RuntimeError("Strategy SELL produced a non-strategy fill")
@@ -1231,6 +1296,9 @@ class BacktestEngine:
         protective_trigger_kind: ProtectiveStopTriggerKind | None = None,
         timed_state: _TimedExitState | None = None,
         maximum_holding_candles: int | None = None,
+        execution_fill_fraction: Decimal = Decimal("1"),
+        execution_quantity_step: Decimal | None = None,
+        cancel_unfilled_remainder: bool = False,
     ) -> tuple[PortfolioState, Fill, tuple[CompletedTrade, ...]]:
         """Apply one SELL through the shared FIFO accounting path."""
         if intent is None:
@@ -1275,19 +1343,27 @@ class BacktestEngine:
         execution_price = market_reference_price * (
             Decimal("1") - self._config.slippage_rate
         )
+        requested_quantity = base_quantity
+        base_quantity = self._paper_fill_quantity(
+            requested_quantity,
+            execution_fill_fraction,
+            execution_quantity_step,
+        )
         quote_notional = base_quantity * execution_price
         fee = quote_notional * self._config.fee_rate
         fill_id = f"{intent.intent_id}:fill:1"
         self._submit_filled_order(
             lifecycle=lifecycle,
             intent=intent,
-            reservation_amount=base_quantity,
+            reservation_amount=requested_quantity,
             available_balance=state.base_balance,
             fill_id=fill_id,
             execution_price=execution_price,
+            fill_quantity=base_quantity,
             quote_notional=quote_notional,
             fee=fee,
             executed_at=row.open_time,
+            cancel_unfilled_remainder=cancel_unfilled_remainder,
         )
         realizations = accounting.record_sell(
             fill_id=fill_id,
@@ -1681,9 +1757,11 @@ class BacktestEngine:
         available_balance: Decimal,
         fill_id: str,
         execution_price: Decimal,
+        fill_quantity: Decimal,
         quote_notional: Decimal,
         fee: Decimal,
         executed_at: int,
+        cancel_unfilled_remainder: bool = False,
     ) -> ExecutionFill:
         order_id = f"order:{intent.intent_id}"
         lifecycle.submit(
@@ -1698,7 +1776,7 @@ class BacktestEngine:
             order_id=order_id,
             instrument=intent.instrument,
             side=intent.side,
-            quantity=intent.quantity,
+            quantity=fill_quantity,
             price=execution_price,
             quote_notional=quote_notional,
             fee=fee,
@@ -1706,9 +1784,36 @@ class BacktestEngine:
             executed_at=executed_at,
         )
         order, applied = lifecycle.apply_fill(execution_fill)
-        if not applied or order.status is not OrderStatus.FILLED:
-            raise RuntimeError("Deterministic backtest order was not fully filled")
+        if not applied:
+            raise RuntimeError("Deterministic execution fill was not applied")
+        if order.status is OrderStatus.PARTIALLY_FILLED:
+            if cancel_unfilled_remainder:
+                order = lifecycle.cancel(
+                    order.order_id,
+                    at=executed_at,
+                    reason="configured paper partial-fill remainder cancellation",
+                )
+            else:
+                return execution_fill
+        if order.status not in (OrderStatus.FILLED, OrderStatus.CANCELLED):
+            raise RuntimeError("Deterministic execution order is not terminal")
         return execution_fill
+
+    @staticmethod
+    def _paper_fill_quantity(
+        requested: Decimal,
+        fraction: Decimal,
+        step: Decimal | None,
+    ) -> Decimal:
+        quantity = requested * fraction
+        if step is not None:
+            quantity = (
+                (quantity / step).to_integral_value(rounding=ROUND_DOWN)
+                * step
+            )
+        if quantity <= 0:
+            raise ValueError("Paper fill quantity rounds to zero")
+        return quantity
 
     @staticmethod
     def _mark_equity(row: FeatureRow, state: PortfolioState) -> EquityPoint:
@@ -2053,6 +2158,10 @@ class BacktestExecutionSession:
         approved_sizing: (
             BuySizingProposal | SellSizingProposal | SizingRejection | None
         ) = None,
+        allow_delayed_execution: bool = False,
+        execution_fill_fraction: Decimal = Decimal("1"),
+        execution_quantity_step: Decimal | None = None,
+        cancel_unfilled_remainder: bool = False,
     ) -> StrategyExecutionOutcome:
         """Execute one not-previously-processed decision at its next open."""
         self._ensure_active()
@@ -2068,6 +2177,10 @@ class BacktestExecutionSession:
             self._fills_by_id,
             self._lifecycle,
             approved_sizing=approved_sizing,
+            allow_delayed_execution=allow_delayed_execution,
+            execution_fill_fraction=execution_fill_fraction,
+            execution_quantity_step=execution_quantity_step,
+            cancel_unfilled_remainder=cancel_unfilled_remainder,
         )
         if intent is not None:
             if intent.intent_id in self._intent_ids:
@@ -2136,11 +2249,15 @@ class BacktestExecutionSession:
         equity_curve: Sequence[EquityPoint],
         last_close: Decimal,
         last_decision: StrategyDecision,
+        add_unexecuted_last_decision: bool = True,
     ) -> BacktestReport:
         """Build the standard report and run the standard engine invariants."""
         if self._final_report is not None:
             return self._final_report
-        if last_decision.signal is not Signal.HOLD:
+        if (
+            add_unexecuted_last_decision
+            and last_decision.signal is not Signal.HOLD
+        ):
             self._skipped.append(SkippedDecision(
                 decision=last_decision,
                 reason="no next candle is available for execution",

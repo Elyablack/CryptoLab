@@ -3,9 +3,10 @@
 ## Scope
 
 CryptoLab is one local Python CLI application for historical public Spot market
-research. It contains no authenticated API, real order execution, portfolio
-daemon, scheduler, web service, queue, or background worker. Execution-domain
-objects and offline adapters are simulations only.
+research and an optional foreground paper-simulation loop. It contains no
+authenticated API, real order execution, deployment daemon, scheduler, web
+service, queue, or background worker. Execution-domain objects and offline
+adapters are simulations only.
 
 Supported sources are Binance Spot and Bybit V5 Spot. Supported intervals are
 `1m`, `5m`, `15m`, `1h`, `4h`, and `1d`. All ranges are UTC and half-open.
@@ -33,18 +34,23 @@ CLI
 │                        ├── independent BacktestEngine evaluations
 │                        ├── period benchmarks and optional walk-forward
 │                        └── text plus JSON/CSV reports
-└── signals-research ─ quality ── SignalEventStudyRunner
+├── signals-research ─ quality ── SignalEventStudyRunner
                                  ├── existing StrategyRunner decisions
                                  ├── next-open forward-return events
                                  ├── deterministic regime-matched controls
                                  ├── overlap-cluster uncertainty
                                  └── text plus JSON/CSV reports
+└── paper ── Bybit public candles/ticker ── ContinuousPaperTrader
+            ├── PersistentReplayRunner (observed-price mode)
+            ├── PaperRiskManager / PaperPositionSizer
+            ├── existing execution lifecycle and FIFO accounting
+            └── versioned paper-state SQLite checkpoints
 ```
 
 ### Market data
 
 - `client.py`: Binance public klines.
-- `bybit_client.py`: Bybit V5 public Spot klines.
+- `bybit_client.py`: Bybit V5 public Spot klines and ticker observations.
 - `http.py`: shared retry and HTTP failure classification.
 - `parser.py`: exchange payloads to immutable `Candle` values.
 - `validator.py`: numeric, OHLCV, sequence, timestamp, and closed checks.
@@ -148,6 +154,16 @@ lifecycle, fills, reservations, FIFO/accounting state, risk state, and
 checkpoint commit atomically. Recovery replays committed candles through the
 same execution path and requires exact agreement with every normalized stored
 table. Details are in `docs/paper-bot-stage-2.md`.
+
+`ContinuousPaperTrader` adds the Stage 3 process boundary. Historical gaps are
+replayed only as non-trading feature warm-up. A decision from the newest fresh
+closed candle can execute only against a separately received public ticker
+observation at or after receipt time; it is never assigned an unavailable
+historical next-open. `PaperRiskManager` gates new intents, while manual pause
+continues to permit risk-reducing SELL. The public-data source, execution
+assumptions, atomic recovery, CLI, and limitations are documented in
+`docs/paper-bot-stage-3.md`. This remains local simulated execution, not a
+testnet or live-trading adapter.
 
 ### Research
 

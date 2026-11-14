@@ -23,7 +23,7 @@ from cryptolab.replay.serialization import (
 )
 
 
-PAPER_STATE_SCHEMA_VERSION = 1
+PAPER_STATE_SCHEMA_VERSION = 2
 PAPER_STATE_SERIALIZATION_VERSION = 1
 
 
@@ -125,6 +125,14 @@ CREATE TABLE paper_checkpoints (
     committed_at_utc TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES paper_sessions(session_id)
 );
+
+CREATE TABLE paper_controls (
+    session_id TEXT PRIMARY KEY,
+    trading_paused INTEGER NOT NULL CHECK (trading_paused IN (0, 1)),
+    revision INTEGER NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES paper_sessions(session_id)
+);
 """
 
 
@@ -156,6 +164,9 @@ class PaperStateRepository:
                     f"PRAGMA user_version = {PAPER_STATE_SCHEMA_VERSION}"
                 )
                 return
+            if version == 1:
+                self._migrate_v1_to_v2(connection)
+                version = PAPER_STATE_SCHEMA_VERSION
             if version != PAPER_STATE_SCHEMA_VERSION:
                 raise ReplayStateIntegrityError(
                     f"Unsupported paper-state schema version {version}; "
@@ -173,6 +184,7 @@ class PaperStateRepository:
                 "paper_accounting",
                 "paper_execution_adapter",
                 "paper_checkpoints",
+                "paper_controls",
             }
             actual = {
                 row[0]
@@ -228,6 +240,14 @@ class PaperStateRepository:
                     checkpoint_event_id=None,
                     checkpoint_open_time=None,
                     crash_at=None,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO paper_controls (
+                        session_id, trading_paused, revision, updated_at_utc
+                    ) VALUES (?, 0, 0, ?)
+                    """,
+                    (session_id, now),
                 )
                 connection.execute("COMMIT")
             except sqlite3.IntegrityError as error:
@@ -400,6 +420,70 @@ class PaperStateRepository:
                 """,
                 (session_id, event_id),
             ).fetchone()
+
+    def session_exists(self, session_id: str) -> bool:
+        """Return whether a named persistent replay session exists."""
+        self._validate_session_id(session_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM paper_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
+    def set_trading_paused(self, session_id: str, paused: bool) -> int:
+        """Persist manual BUY pause independently from replay reconstruction."""
+        self._validate_session_id(session_id)
+        if type(paused) is not bool:
+            raise ValueError("paused must be a boolean")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT revision FROM paper_controls WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute("ROLLBACK")
+                raise ReplayStateIntegrityError(
+                    f"Unknown replay session: {session_id}"
+                )
+            if type(row[0]) is not int or row[0] < 0:
+                connection.execute("ROLLBACK")
+                raise ReplayStateIntegrityError(
+                    "Invalid paper control revision"
+                )
+            revision = int(row[0]) + 1
+            connection.execute(
+                """
+                UPDATE paper_controls
+                SET trading_paused = ?, revision = ?, updated_at_utc = ?
+                WHERE session_id = ?
+                """,
+                (int(paused), revision, _utc_now(), session_id),
+            )
+            connection.execute("COMMIT")
+        return revision
+
+    def get_trading_paused(self, session_id: str) -> bool:
+        """Load the durable manual trading pause flag."""
+        self._validate_session_id(session_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT trading_paused, revision
+                FROM paper_controls WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise ReplayStateIntegrityError(
+                f"Unknown replay session: {session_id}"
+            )
+        if row[0] not in (0, 1):
+            raise ReplayStateIntegrityError("Invalid paper trading pause state")
+        if type(row[1]) is not int or row[1] < 0:
+            raise ReplayStateIntegrityError("Invalid paper control revision")
+        return bool(row[0])
 
     def verify_checkpoint(
         self,
@@ -807,6 +891,43 @@ class PaperStateRepository:
         )
         connection.execute("PRAGMA foreign_keys = ON")
         return connection
+
+    @staticmethod
+    def _migrate_v1_to_v2(connection: sqlite3.Connection) -> None:
+        """Add durable operator controls without rebuilding Stage 2 state."""
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE paper_controls (
+                    session_id TEXT PRIMARY KEY,
+                    trading_paused INTEGER NOT NULL
+                        CHECK (trading_paused IN (0, 1)),
+                    revision INTEGER NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    FOREIGN KEY (session_id)
+                        REFERENCES paper_sessions(session_id)
+                )
+                """
+            )
+            now = _utc_now()
+            connection.execute(
+                """
+                INSERT INTO paper_controls (
+                    session_id, trading_paused, revision, updated_at_utc
+                )
+                SELECT session_id, 0, 0, ? FROM paper_sessions
+                """,
+                (now,),
+            )
+            connection.execute(
+                "UPDATE paper_sessions SET schema_version = 2"
+            )
+            connection.execute("PRAGMA user_version = 2")
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
 
     @staticmethod
     def _validate_session_id(session_id: str) -> None:

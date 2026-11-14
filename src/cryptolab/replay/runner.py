@@ -34,8 +34,10 @@ from cryptolab.market_data.validator import (
 )
 from cryptolab.replay.models import (
     DeterministicReplayReport,
+    PriceObservation,
     ReplayCandleResult,
     ReplayEvent,
+    ReplayExecutionMode,
     ReplayEventType,
     ReplayMetadataValue,
     ReplayPortfolioSnapshot,
@@ -81,11 +83,23 @@ class DeterministicReplayRunner:
         position_sizer: PositionSizer | None = None,
         risk_policy: ReplayRiskPolicy | None = None,
         feature_builder: FeatureBuilder | None = None,
+        execution_mode: ReplayExecutionMode = (
+            ReplayExecutionMode.NEXT_CANDLE_OPEN
+        ),
+        execution_fill_fraction: Decimal = Decimal("1"),
+        execution_quantity_step: Decimal | None = None,
+        cancel_unfilled_remainder: bool = False,
     ) -> None:
         self._config = config or BacktestConfig()
         self._position_sizer = position_sizer or LegacyAllInAllOutSizer()
         self._risk_policy = risk_policy or AllowAllReplayRiskPolicy()
         self._feature_builder = feature_builder or FeatureBuilder()
+        if not isinstance(execution_mode, ReplayExecutionMode):
+            raise ValueError("execution_mode must be a ReplayExecutionMode")
+        self._execution_mode = execution_mode
+        self._execution_fill_fraction = execution_fill_fraction
+        self._execution_quantity_step = execution_quantity_step
+        self._cancel_unfilled_remainder = cancel_unfilled_remainder
         if (
             not isinstance(self._risk_policy.name, str)
             or not self._risk_policy.name.strip()
@@ -111,6 +125,10 @@ class DeterministicReplayRunner:
             feature_builder=self._feature_builder,
             exchange=exchange,
             market_type=market_type,
+            execution_mode=self._execution_mode,
+            execution_fill_fraction=self._execution_fill_fraction,
+            execution_quantity_step=self._execution_quantity_step,
+            cancel_unfilled_remainder=self._cancel_unfilled_remainder,
         )
 
     def run(
@@ -150,6 +168,10 @@ class DeterministicReplaySession:
         feature_builder: FeatureBuilder,
         exchange: str,
         market_type: str,
+        execution_mode: ReplayExecutionMode,
+        execution_fill_fraction: Decimal,
+        execution_quantity_step: Decimal | None,
+        cancel_unfilled_remainder: bool,
     ) -> None:
         validate_market_identity(exchange, market_type)
         if not isinstance(symbol, str) or not symbol.endswith("USDT"):
@@ -161,6 +183,10 @@ class DeterministicReplaySession:
         self._exchange = exchange
         self._market_type = market_type
         self._config = config
+        self._execution_mode = execution_mode
+        self._execution_fill_fraction = execution_fill_fraction
+        self._execution_quantity_step = execution_quantity_step
+        self._cancel_unfilled_remainder = cancel_unfilled_remainder
         self._risk_policy = risk_policy
         self._feature_builder = feature_builder
         self._strategy_runner = StrategyRunner([strategy])
@@ -191,6 +217,7 @@ class DeterministicReplaySession:
         self._candle_results: dict[str, ReplayCandleResult] = {}
         self._candle_event_order: list[str] = []
         self._final_report: DeterministicReplayReport | None = None
+        self._last_mark_price: Decimal | None = None
 
     @property
     def clock(self) -> DeterministicReplayClock:
@@ -242,6 +269,10 @@ class DeterministicReplaySession:
         event_id: str | None = None,
     ) -> ReplayCandleResult:
         """Process one candle idempotently by its deterministic event ID."""
+        if self._execution_mode is not ReplayExecutionMode.NEXT_CANDLE_OPEN:
+            raise RuntimeError(
+                "Use process_observed_candle() for observed-price replay"
+            )
         if self._final_report is not None:
             raise RuntimeError("Replay session is already finalized")
         if not isinstance(candle, Candle):
@@ -325,6 +356,7 @@ class DeterministicReplaySession:
         )
         equity_point = self._execution.mark_equity(row)
         self._equity_curve.append(equity_point)
+        self._last_mark_price = candle.close
         close_snapshot = self._snapshot(
             phase="candle_close",
             observed_at=available_time,
@@ -346,6 +378,173 @@ class DeterministicReplaySession:
         self._candle_event_order.append(candle_event_id)
         return result
 
+    def process_observed_candle(
+        self,
+        candle: Candle,
+        *,
+        received_at: int,
+        price_observation: PriceObservation | None,
+        trading_enabled: bool,
+        event_id: str | None = None,
+    ) -> ReplayCandleResult:
+        """Process a received closed candle and optionally trade its decision.
+
+        Unlike historical replay, the current decision is never filled at a
+        past candle open. When trading is enabled it uses only the explicitly
+        observed public price and its local receipt timestamp.
+        """
+        if self._execution_mode is not ReplayExecutionMode.OBSERVED_AFTER_CLOSE:
+            raise RuntimeError(
+                "Observed candle processing requires observed execution mode"
+            )
+        if self._final_report is not None:
+            raise RuntimeError("Replay session is already finalized")
+        if not isinstance(candle, Candle):
+            raise ValueError("candle must be a Candle")
+        if type(received_at) is not int or received_at <= candle.close_time:
+            raise ValueError("received_at must be after the candle close")
+        if type(trading_enabled) is not bool:
+            raise ValueError("trading_enabled must be a boolean")
+        if trading_enabled and price_observation is None:
+            raise ValueError("Trading requires a public price observation")
+        if (
+            price_observation is not None
+            and price_observation.observed_at < received_at
+        ):
+            raise ValueError("Price observation cannot predate candle receipt")
+
+        candle_event_id = event_id or self._candle_event_id(candle)
+        if not isinstance(candle_event_id, str) or not candle_event_id.strip():
+            raise ValueError("Candle event_id must be non-empty")
+        previous = self._processed_candles.get(candle_event_id)
+        if previous is not None:
+            if previous != candle:
+                raise ValueError("Conflicting duplicate candle event")
+            return self._candle_results[candle_event_id]
+
+        self._validate_next_candle(candle)
+        self._clock.advance_to(received_at)
+        self._candles.append(candle)
+        self._record(
+            event_id=f"{candle_event_id}:closed",
+            event_type=ReplayEventType.CANDLE_CLOSED,
+            occurred_at=received_at,
+            candle_open_time=candle.open_time,
+            metadata={
+                "close_price": candle.close,
+                "received_at": received_at,
+            },
+        )
+        self._rows = self._feature_builder.build(
+            self._candles,
+            interval=self._interval,
+            as_of_time=received_at,
+        )
+        self._record(
+            event_id=f"{candle_event_id}:features",
+            event_type=ReplayEventType.FEATURE_UPDATED,
+            occurred_at=received_at,
+            candle_open_time=candle.open_time,
+            metadata={"available_feature_rows": len(self._rows)},
+        )
+        decision = self._strategy_runner.evaluate_latest(
+            self._symbol,
+            self._interval,
+            self._rows,
+            as_of_time=received_at,
+        )[0]
+        self._decisions.append(decision)
+        self._record(
+            event_id=f"{candle_event_id}:decision",
+            event_type=ReplayEventType.STRATEGY_DECISION,
+            occurred_at=received_at,
+            candle_open_time=candle.open_time,
+            metadata={
+                "signal": decision.signal.value,
+                "strategy": decision.strategy_name,
+                "signal_available_time": decision.signal_available_time,
+                "decision_received_at": received_at,
+            },
+        )
+        open_snapshot = self._snapshot(
+            phase="paper_before_execution",
+            observed_at=received_at,
+            candle_open_time=candle.open_time,
+            mark_price=candle.close,
+            event_id=f"{candle_event_id}:open-snapshot",
+        )
+
+        outcome: StrategyExecutionOutcome | None
+        mark_price = candle.close
+        mark_time = received_at
+        if trading_enabled:
+            if price_observation is None:
+                raise RuntimeError("Missing required price observation")
+            self._clock.advance_to(price_observation.observed_at)
+            self._record(
+                event_id=f"{candle_event_id}:price",
+                event_type=ReplayEventType.PRICE_OBSERVED,
+                occurred_at=price_observation.observed_at,
+                candle_open_time=candle.open_time,
+                metadata={
+                    "price": price_observation.price,
+                    "source": price_observation.source,
+                },
+            )
+            execution_row = self._observed_price_row(
+                candle,
+                price_observation,
+            )
+            outcome = self._process_pending_decision(
+                candle_event_id,
+                candle,
+                decision,
+                execution_row=execution_row,
+                allow_delayed_execution=True,
+                received_at=received_at,
+            )
+            mark_price = price_observation.price
+            mark_time = price_observation.observed_at
+        else:
+            outcome = self._process_backfill_decision(
+                candle_event_id,
+                candle,
+                decision,
+                received_at,
+            )
+
+        state = self._execution.state
+        equity = state.quote_balance + state.base_balance * mark_price
+        self._equity_curve.append(EquityPoint(
+            candle_open_time=candle.open_time,
+            available_time=mark_time,
+            close_price=mark_price,
+            quote_balance=state.quote_balance,
+            base_balance=state.base_balance,
+            equity=equity,
+        ))
+        self._last_mark_price = mark_price
+        close_snapshot = self._snapshot(
+            phase="paper_after_execution",
+            observed_at=mark_time,
+            candle_open_time=candle.open_time,
+            mark_price=mark_price,
+            event_id=f"{candle_event_id}:close-snapshot",
+        )
+        result = ReplayCandleResult(
+            candle_event_id=candle_event_id,
+            candle=candle,
+            executed_decision=decision if trading_enabled else None,
+            execution_outcome=outcome,
+            new_decision=decision,
+            open_snapshot=open_snapshot,
+            close_snapshot=close_snapshot,
+        )
+        self._processed_candles[candle_event_id] = candle
+        self._candle_results[candle_event_id] = result
+        self._candle_event_order.append(candle_event_id)
+        return result
+
     def finish(self) -> DeterministicReplayReport:
         """Finalize once; an actionable last decision remains unexecuted."""
         if self._final_report is not None:
@@ -353,7 +552,10 @@ class DeterministicReplaySession:
         if not self._candles or not self._decisions:
             raise ValueError("Replay requires at least one candle")
         last_decision = self._decisions[-1]
-        if last_decision.signal is not Signal.HOLD:
+        if (
+            self._execution_mode is ReplayExecutionMode.NEXT_CANDLE_OPEN
+            and last_decision.signal is not Signal.HOLD
+        ):
             self._record(
                 event_id=(
                     f"replay:{self._symbol}:{last_decision.candle_open_time}:"
@@ -371,8 +573,11 @@ class DeterministicReplaySession:
             exchange=self._exchange,
             market_type=self._market_type,
             equity_curve=self._equity_curve,
-            last_close=self._candles[-1].close,
+            last_close=self._last_mark_price or self._candles[-1].close,
             last_decision=last_decision,
+            add_unexecuted_last_decision=(
+                self._execution_mode is ReplayExecutionMode.NEXT_CANDLE_OPEN
+            ),
         )
         self._final_report = DeterministicReplayReport(
             backtest=backtest,
@@ -389,16 +594,28 @@ class DeterministicReplaySession:
         candle_event_id: str,
         candle: Candle,
         decision: StrategyDecision,
+        *,
+        execution_row: FeatureRow | None = None,
+        allow_delayed_execution: bool = False,
+        received_at: int | None = None,
     ) -> StrategyExecutionOutcome:
-        if decision.signal_available_time != candle.open_time:
+        if (
+            not allow_delayed_execution
+            and decision.signal_available_time != candle.open_time
+        ):
             raise RuntimeError("Pending decision is not aligned to next open")
-        execution_row = self._open_only_row(candle)
+        execution_row = execution_row or self._open_only_row(candle)
+        execution_time = (
+            execution_row.open_time
+            if allow_delayed_execution
+            else candle.open_time
+        )
         sizing = self._execution.prepare_sizing(decision, execution_row)
         if sizing is not None:
             self._record(
                 event_id=f"{candle_event_id}:sizing",
                 event_type=ReplayEventType.POSITION_SIZED,
-                occurred_at=candle.open_time,
+                occurred_at=execution_time,
                 candle_open_time=decision.candle_open_time,
                 metadata=self._sizing_metadata(sizing),
             )
@@ -407,8 +624,26 @@ class DeterministicReplaySession:
             sizing=sizing,
             portfolio=self._execution.state,
             instrument=self._instrument,
-            market_open_price=candle.open,
-            observed_at=candle.open_time,
+            market_open_price=execution_row.open,
+            observed_at=execution_time,
+            candle_close_time=candle.close_time,
+            data_received_at=received_at,
+            reserved_quote=sum(
+                (
+                    item.remaining_amount
+                    for item in self._execution.reservations
+                    if item.asset == self._instrument.quote_asset
+                ),
+                Decimal("0"),
+            ),
+            open_order_count=sum(
+                not order.status.is_terminal
+                for order in self._execution.orders
+            ),
+            equity=(
+                self._execution.state.quote_balance
+                + self._execution.state.base_balance * execution_row.open
+            ),
         )
         risk = self._risk_policy.check(risk_context)
         if not isinstance(risk, RiskCheckResult):
@@ -416,7 +651,7 @@ class DeterministicReplaySession:
         self._record(
             event_id=f"{candle_event_id}:risk",
             event_type=ReplayEventType.RISK_CHECKED,
-            occurred_at=candle.open_time,
+            occurred_at=execution_time,
             candle_open_time=decision.candle_open_time,
             metadata={"accepted": risk.accepted, "reason": risk.reason},
         )
@@ -425,6 +660,10 @@ class DeterministicReplaySession:
                 decision,
                 execution_row,
                 approved_sizing=sizing,
+                allow_delayed_execution=allow_delayed_execution,
+                execution_fill_fraction=self._execution_fill_fraction,
+                execution_quantity_step=self._execution_quantity_step,
+                cancel_unfilled_remainder=self._cancel_unfilled_remainder,
             )
         else:
             outcome = self._execution.reject(decision, risk.reason)
@@ -432,7 +671,7 @@ class DeterministicReplaySession:
             self._record(
                 event_id=f"{candle_event_id}:intent",
                 event_type=ReplayEventType.ORDER_INTENT_CREATED,
-                occurred_at=candle.open_time,
+                occurred_at=execution_time,
                 candle_open_time=decision.candle_open_time,
                 metadata={
                     "intent_id": outcome.order_intent.intent_id,
@@ -443,7 +682,7 @@ class DeterministicReplaySession:
             self._record(
                 event_id=f"{candle_event_id}:fill",
                 event_type=ReplayEventType.FILL_APPLIED,
-                occurred_at=candle.open_time,
+                occurred_at=execution_time,
                 candle_open_time=decision.candle_open_time,
                 metadata={
                     "fill_id": outcome.fill.fill_id,
@@ -453,7 +692,7 @@ class DeterministicReplaySession:
             self._record(
                 event_id=f"{candle_event_id}:accounting",
                 event_type=ReplayEventType.ACCOUNTING_UPDATED,
-                occurred_at=candle.open_time,
+                occurred_at=execution_time,
                 candle_open_time=decision.candle_open_time,
                 metadata={
                     "quote_balance": outcome.state.quote_balance,
@@ -464,10 +703,63 @@ class DeterministicReplaySession:
             self._record(
                 event_id=f"{candle_event_id}:skipped",
                 event_type=ReplayEventType.DECISION_SKIPPED,
-                occurred_at=candle.open_time,
+                occurred_at=execution_time,
                 candle_open_time=decision.candle_open_time,
                 metadata={"reason": outcome.skipped_decision.reason},
             )
+        return outcome
+
+    def _process_backfill_decision(
+        self,
+        candle_event_id: str,
+        candle: Candle,
+        decision: StrategyDecision,
+        received_at: int,
+    ) -> StrategyExecutionOutcome | None:
+        context = ReplayRiskContext(
+            decision=decision,
+            sizing=None,
+            portfolio=self._execution.state,
+            instrument=self._instrument,
+            market_open_price=candle.close,
+            observed_at=received_at,
+            candle_close_time=candle.close_time,
+            data_received_at=received_at,
+            equity=(
+                self._execution.state.quote_balance
+                + self._execution.state.base_balance * candle.close
+            ),
+        )
+        risk = self._risk_policy.check(context)
+        if not isinstance(risk, RiskCheckResult):
+            raise TypeError("Risk policy returned an unsupported result")
+        self._record(
+            event_id=f"{candle_event_id}:risk",
+            event_type=ReplayEventType.RISK_CHECKED,
+            occurred_at=received_at,
+            candle_open_time=decision.candle_open_time,
+            metadata={"accepted": risk.accepted, "reason": risk.reason},
+        )
+        self._record(
+            event_id=f"{candle_event_id}:backfill",
+            event_type=ReplayEventType.BACKFILL_DECISION_SUPPRESSED,
+            occurred_at=received_at,
+            candle_open_time=decision.candle_open_time,
+            metadata={"signal": decision.signal.value},
+        )
+        if decision.signal is Signal.HOLD:
+            return None
+        outcome = self._execution.reject(
+            decision,
+            "historical backfill cannot create retroactive paper orders",
+        )
+        self._record(
+            event_id=f"{candle_event_id}:skipped",
+            event_type=ReplayEventType.DECISION_SKIPPED,
+            occurred_at=received_at,
+            candle_open_time=decision.candle_open_time,
+            metadata={"reason": outcome.skipped_decision.reason},
+        )
         return outcome
 
     def _snapshot(
@@ -556,6 +848,30 @@ class DeterministicReplaySession:
             high=candle.open,
             low=candle.open,
             close=candle.open,
+            volume=Decimal("0"),
+            simple_return=None,
+            log_return=None,
+            sma20=None,
+            sma50=None,
+            ema20=None,
+            rsi14=None,
+            atr14=None,
+            rvol20=None,
+        )
+
+    @staticmethod
+    def _observed_price_row(
+        candle: Candle,
+        observation: PriceObservation,
+    ) -> FeatureRow:
+        return FeatureRow(
+            open_time=observation.observed_at,
+            close_time=observation.observed_at,
+            available_time=observation.observed_at + 1,
+            open=observation.price,
+            high=observation.price,
+            low=observation.price,
+            close=observation.price,
             volume=Decimal("0"),
             simple_return=None,
             log_return=None,

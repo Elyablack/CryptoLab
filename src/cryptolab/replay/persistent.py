@@ -17,7 +17,10 @@ from cryptolab.market_data.markets import DEFAULT_EXCHANGE, SPOT_MARKET_TYPE
 from cryptolab.market_data.models import Candle
 from cryptolab.replay.models import (
     DeterministicReplayReport,
+    ObservedCandleEvent,
+    PriceObservation,
     ReplayCandleResult,
+    ReplayExecutionMode,
     ReplaySessionCheckpoint,
 )
 from cryptolab.replay.persistence_models import (
@@ -42,7 +45,9 @@ from cryptolab.replay.serialization import (
     component_configuration,
     decode_mapping,
     deserialize_candle,
+    deserialize_observed_candle_event,
     serialize_candle,
+    serialize_observed_candle_event,
 )
 from cryptolab.storage.paper_state_repository import PaperStateRepository
 from cryptolab.strategies.base import Strategy
@@ -59,6 +64,12 @@ class PersistentReplayRunner:
         position_sizer: PositionSizer | None = None,
         risk_policy: PersistentReplayRiskPolicy | None = None,
         feature_builder: FeatureBuilder | None = None,
+        execution_mode: ReplayExecutionMode = (
+            ReplayExecutionMode.NEXT_CANDLE_OPEN
+        ),
+        execution_fill_fraction: Decimal = Decimal("1"),
+        execution_quantity_step: Decimal | None = None,
+        cancel_unfilled_remainder: bool = False,
     ) -> None:
         self._repository = PaperStateRepository(database_path)
         self._repository.init_schema()
@@ -66,6 +77,12 @@ class PersistentReplayRunner:
         self._position_sizer = position_sizer or LegacyAllInAllOutSizer()
         self._risk_policy = risk_policy or AllowAllReplayRiskPolicy()
         self._feature_builder = feature_builder or FeatureBuilder()
+        if not isinstance(execution_mode, ReplayExecutionMode):
+            raise ValueError("execution_mode must be a ReplayExecutionMode")
+        self._execution_mode = execution_mode
+        self._execution_fill_fraction = execution_fill_fraction
+        self._execution_quantity_step = execution_quantity_step
+        self._cancel_unfilled_remainder = cancel_unfilled_remainder
         if type(self._feature_builder) is not FeatureBuilder:
             raise ValueError(
                 "Persistent replay currently requires the standard "
@@ -161,15 +178,34 @@ class PersistentReplayRunner:
         )
         try:
             for stored_candle in stored.candles:
-                candle = deserialize_candle(stored_candle.payload)
+                if (
+                    self._execution_mode
+                    is ReplayExecutionMode.OBSERVED_AFTER_CLOSE
+                ):
+                    paper_event = deserialize_observed_candle_event(
+                        stored_candle.payload
+                    )
+                    candle = paper_event.candle
+                else:
+                    paper_event = None
+                    candle = deserialize_candle(stored_candle.payload)
                 if candle.open_time != stored_candle.open_time:
                     raise ReplayStateIntegrityError(
                         "Candle payload timestamp differs from journal"
                     )
-                session.process_candle(
-                    candle,
-                    event_id=stored_candle.event_id,
-                )
+                if paper_event is None:
+                    session.process_candle(
+                        candle,
+                        event_id=stored_candle.event_id,
+                    )
+                else:
+                    session.process_observed_candle(
+                        candle,
+                        received_at=paper_event.received_at,
+                        price_observation=paper_event.price_observation,
+                        trading_enabled=paper_event.trading_enabled,
+                        event_id=stored_candle.event_id,
+                    )
         except ReplayStateIntegrityError:
             raise
         except Exception as error:
@@ -222,6 +258,10 @@ class PersistentReplayRunner:
             position_sizer=self._position_sizer,
             risk_policy=self._risk_policy,
             feature_builder=self._feature_builder,
+            execution_mode=self._execution_mode,
+            execution_fill_fraction=self._execution_fill_fraction,
+            execution_quantity_step=self._execution_quantity_step,
+            cancel_unfilled_remainder=self._cancel_unfilled_remainder,
         ).start(
             strategy,
             symbol,
@@ -248,7 +288,7 @@ class PersistentReplayRunner:
                 self._risk_policy.persistence_configuration()
             ),
         }
-        return canonical_json({
+        configuration = {
             "serialization_version": SERIALIZATION_VERSION,
             "exchange": exchange,
             "market_type": market_type,
@@ -262,7 +302,16 @@ class PersistentReplayRunner:
                 f"{type(self._feature_builder).__qualname__}"
             ),
             "risk_policy": risk_configuration,
-        })
+        }
+        # Omit the legacy default so Stage 2 databases remain recoverable.
+        if self._execution_mode is not ReplayExecutionMode.NEXT_CANDLE_OPEN:
+            configuration["execution_mode"] = self._execution_mode.value
+            configuration["paper_execution"] = {
+                "fill_fraction": self._execution_fill_fraction,
+                "quantity_step": self._execution_quantity_step,
+                "cancel_unfilled_remainder": self._cancel_unfilled_remainder,
+            }
+        return canonical_json(configuration)
 
     def _risk_state_json(self) -> str:
         return canonical_json(dict(self._risk_policy.snapshot_state()))
@@ -419,6 +468,98 @@ class PersistentReplaySession:
                 event_id=result.candle_event_id,
                 candle_open_time=candle.open_time,
                 candle_payload=candle_payload,
+                checkpoint=checkpoint,
+                risk_state_json=canonical_json(
+                    dict(self._risk_policy.snapshot_state())
+                ),
+                crash_at=crash_at,
+            )
+            self._last_checkpoint = checkpoint
+            return result
+        except Exception:
+            self._failed = True
+            raise
+
+    def process_observed_candle(
+        self,
+        candle: Candle,
+        *,
+        received_at: int,
+        price_observation: PriceObservation | None,
+        trading_enabled: bool,
+        event_id: str | None = None,
+        crash_at: CrashPoint | None = None,
+    ) -> ReplayCandleResult:
+        """Atomically process one closed candle in observed-price mode."""
+        paper_event = ObservedCandleEvent(
+            candle=candle,
+            received_at=received_at,
+            price_observation=price_observation,
+            trading_enabled=trading_enabled,
+        )
+        identity = self._inner.checkpoint()
+        resolved_event_id = event_id if event_id is not None else ":".join((
+            "closed-candle",
+            identity.exchange,
+            identity.market_type,
+            identity.symbol,
+            identity.interval,
+            str(candle.open_time),
+        ))
+        payload = serialize_observed_candle_event(paper_event)
+        return self._process_observed_event(
+            paper_event,
+            resolved_event_id,
+            payload,
+            crash_at,
+        )
+
+    def _process_observed_event(
+        self,
+        event: ObservedCandleEvent,
+        event_id: str,
+        payload: str,
+        crash_at: CrashPoint | None,
+    ) -> ReplayCandleResult:
+        self._ensure_available()
+        if self._report is not None:
+            raise ReplaySessionUnavailableError(
+                "Persistent replay session is already finalized"
+            )
+        existing = self._repository.get_candle_event(
+            self._session_id,
+            event_id,
+        )
+        if existing is not None:
+            if existing != (event.candle.open_time, payload):
+                self._failed = True
+                raise ReplayStateIntegrityError(
+                    "Conflicting duplicate persistent candle event"
+                )
+            return self._inner.process_observed_candle(
+                event.candle,
+                received_at=event.received_at,
+                price_observation=event.price_observation,
+                trading_enabled=event.trading_enabled,
+                event_id=event_id,
+            )
+        try:
+            _inject(crash_at, CrashPoint.BEFORE_PROCESSING)
+            result = self._inner.process_observed_candle(
+                event.candle,
+                received_at=event.received_at,
+                price_observation=event.price_observation,
+                trading_enabled=event.trading_enabled,
+                event_id=event_id,
+            )
+            checkpoint = self._inner.checkpoint()
+            PersistentReplayRunner._assert_checkpoint_invariants(checkpoint)
+            _inject(crash_at, CrashPoint.BEFORE_TRANSACTION)
+            self._repository.commit_candle(
+                session_id=self._session_id,
+                event_id=result.candle_event_id,
+                candle_open_time=event.candle.open_time,
+                candle_payload=payload,
                 checkpoint=checkpoint,
                 risk_state_json=canonical_json(
                     dict(self._risk_policy.snapshot_state())

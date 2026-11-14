@@ -53,8 +53,10 @@ formatting is reproducible after recovery and is not a separate trading event.
 ## SQLite schema
 
 Paper-state schema version is stored in `PRAGMA user_version` and is currently
-`1`. The serialization format is independently versioned as `1` in each
-session row. Unknown versions and unversioned non-empty databases fail closed.
+`2`. Version 2 adds the durable manual-control table used by Stage 3 and
+migrates v1 transactionally without rebuilding replay data. The serialization
+format is independently versioned as `1` in each session row. Unknown versions
+and unversioned non-empty databases fail closed.
 
 | Table | Responsibility |
 |---|---|
@@ -69,6 +71,7 @@ session row. Unknown versions and unversioned non-empty databases fail closed.
 | `paper_execution_adapter` | Complete typed adapter snapshot: intents, lifecycle, fills, reservations and event sequence |
 | `paper_accounting` | Portfolio state, backtest fills, completed trades, FIFO lots, realizations and position cycles |
 | `paper_checkpoints` | Last committed candle, full replay snapshot, risk state and replay event count |
+| `paper_controls` | Durable manual BUY pause and operator-control revision |
 
 All financial `Decimal` values are serialized using exact decimal strings.
 They are never converted to JSON or SQLite floating-point numbers. Historical
@@ -255,7 +258,8 @@ passed 490 tests.
 - one SQLite writer is assumed; no distributed locking or leader election;
 - no network data source, polling, scheduling, venue authentication, or order
   submission;
-- no automatic schema migration beyond the initial version;
+- Stage 2 v1 is migrated transactionally to v2 only to add the Stage 3
+  operator-control table; unknown/newer schemas still fail closed;
 - persistent strategies and position sizers must have deterministic,
   serializable configuration;
 - persistent replay currently requires the standard stateless
@@ -269,4 +273,6 @@ passed 490 tests.
 - no multi-symbol/shared-cash persistent replay;
 - no persistent trailing, protective, or timed-exit replay.
 
-Stage 3 is not implemented by this change.
+Stage 3 is implemented as a separate observed-price mode and continuous
+orchestrator; see `docs/paper-bot-stage-3.md`. Legacy Stage 2 next-open replay
+remains the default API and configuration fingerprint.

@@ -25,6 +25,7 @@ from cryptolab.execution.models import (
     OrderStatus,
 )
 from cryptolab.market_data.models import Candle
+from cryptolab.replay.models import ObservedCandleEvent, PriceObservation
 
 
 SERIALIZATION_VERSION = 1
@@ -113,6 +114,64 @@ def deserialize_candle(payload: str) -> Candle:
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("Invalid persisted candle payload") from error
+
+
+def serialize_observed_candle_event(event: ObservedCandleEvent) -> str:
+    """Serialize the timing context required to replay one paper cycle."""
+    if not isinstance(event, ObservedCandleEvent):
+        raise ValueError("event must be an ObservedCandleEvent")
+    observation = event.price_observation
+    return canonical_json({
+        "kind": "observed_closed_candle_v1",
+        "candle": json.loads(serialize_candle(event.candle)),
+        "received_at": event.received_at,
+        "trading_enabled": event.trading_enabled,
+        "price_observation": (
+            None
+            if observation is None
+            else {
+                "price": str(observation.price),
+                "observed_at": observation.observed_at,
+                "source": observation.source,
+            }
+        ),
+    })
+
+
+def deserialize_observed_candle_event(payload: str) -> ObservedCandleEvent:
+    """Restore and validate a paper-cycle journal payload."""
+    try:
+        raw = json.loads(payload)
+        if not isinstance(raw, dict):
+            raise TypeError("paper candle payload must be an object")
+        if raw.get("kind") != "observed_closed_candle_v1":
+            raise ValueError("unsupported paper candle payload kind")
+        candle_raw = raw["candle"]
+        if not isinstance(candle_raw, dict):
+            raise TypeError("paper candle must be an object")
+        observation_raw = raw["price_observation"]
+        observation: PriceObservation | None
+        if observation_raw is None:
+            observation = None
+        else:
+            if not isinstance(observation_raw, dict):
+                raise TypeError("price observation must be an object")
+            observation = PriceObservation(
+                price=Decimal(_required_str(observation_raw, "price")),
+                observed_at=_required_int(observation_raw, "observed_at"),
+                source=_required_str(observation_raw, "source"),
+            )
+        trading_enabled = raw["trading_enabled"]
+        if type(trading_enabled) is not bool:
+            raise TypeError("trading_enabled must be a boolean")
+        return ObservedCandleEvent(
+            candle=deserialize_candle(json.dumps(candle_raw)),
+            received_at=_required_int(raw, "received_at"),
+            price_observation=observation,
+            trading_enabled=trading_enabled,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Invalid persisted paper candle payload") from error
 
 
 def decode_mapping(payload: str) -> dict[str, object]:

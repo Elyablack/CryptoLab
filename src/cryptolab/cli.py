@@ -3,10 +3,12 @@
 import argparse
 import json
 import logging
+import signal
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from threading import Event
 
 from cryptolab.analytics.analyzer import MarketAnalyzer
 from cryptolab.analytics.formatter import format_market_report
@@ -38,6 +40,13 @@ from cryptolab.market_data.markets import (
     SUPPORTED_EXCHANGES,
 )
 from cryptolab.market_data.parser import parse_bybit_klines
+from cryptolab.paper import (
+    ContinuousPaperTrader,
+    PaperBotConfig,
+    PaperExecutionConfig,
+    PaperRiskConfig,
+    set_paper_trading_pause,
+)
 from cryptolab.research import StrategyResearchRunner
 from cryptolab.research.event_study import SignalEventStudyRunner
 from cryptolab.research.event_study_formatter import (
@@ -77,6 +86,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = _create_parser()
     args = parser.parse_args(argv)
     _configure_logging(args.verbose)
+
+    if args.command == "paper":
+        return _run_paper(args)
 
     if args.end <= args.start:
         parser.error("--end must be later than --start")
@@ -122,6 +134,140 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"unsupported command: {args.command}")
     return 2
+
+
+def _run_paper(args: argparse.Namespace) -> int:
+    """Run or inspect the public-data-only Stage 3 paper process."""
+    try:
+        if args.paper_command in ("pause", "resume"):
+            paused = args.paper_command == "pause"
+            revision = set_paper_trading_pause(
+                args.state_database,
+                args.session_id,
+                paused,
+            )
+            print(
+                f"Paper trading {'paused' if paused else 'resumed'}: "
+                f"session={args.session_id}, revision={revision}"
+            )
+            return 0
+
+        strategies = _create_strategies(args.strategy)
+        if len(strategies) != 1:
+            raise ValueError("Paper trading requires exactly one strategy")
+        position_sizer: PositionSizer | None = None
+        if args.position_size_fraction is not None:
+            position_sizer = FixedFractionPositionSizer(
+                args.position_size_fraction
+            )
+        trader = ContinuousPaperTrader(
+            PaperBotConfig(
+                session_id=args.session_id,
+                market_database=args.market_database,
+                state_database=args.state_database,
+                symbol=args.symbol,
+                interval=args.interval,
+                warmup_candles=args.warmup_candles,
+                poll_seconds=args.poll_seconds,
+            ),
+            strategies[0],
+            backtest_config=BacktestConfig(
+                initial_cash=Decimal("1000"),
+                fee_rate=args.fee_rate,
+                slippage_rate=args.slippage_rate,
+            ),
+            risk_config=PaperRiskConfig(
+                maximum_order_notional=args.maximum_order_notional,
+                maximum_position_notional=args.maximum_position_notional,
+                maximum_total_exposure=args.maximum_total_exposure,
+                minimum_available_cash=args.minimum_available_cash,
+                maximum_daily_loss=args.maximum_daily_loss,
+                maximum_portfolio_drawdown=(
+                    args.maximum_portfolio_drawdown
+                ),
+                data_freshness_limit_ms=args.data_freshness_seconds * 1000,
+            ),
+            execution_config=PaperExecutionConfig(
+                quantity_step=args.quantity_step,
+                minimum_quantity=args.minimum_quantity,
+                minimum_notional=args.minimum_notional,
+                simulated_latency_ms=args.simulated_latency_ms,
+                partial_fill_fraction=args.partial_fill_fraction,
+                cancel_unfilled_remainder=(
+                    not args.keep_partial_order_open
+                ),
+            ),
+            position_sizer=position_sizer,
+        )
+        if args.paper_command == "run-once":
+            result = trader.run_once()
+            _print_paper_cycle(result)
+            trader.close()
+            return 0
+        if args.paper_command in ("status", "integrity"):
+            status = (
+                trader.check_integrity()
+                if args.paper_command == "integrity"
+                else trader.status()
+            )
+            _print_paper_status(status)
+            if args.paper_command == "integrity":
+                print("Paper session integrity: OK")
+            trader.close()
+            return 0
+        if args.paper_command == "run":
+            stop = Event()
+
+            def request_stop(signum, frame) -> None:
+                del signum, frame
+                stop.set()
+
+            signal.signal(signal.SIGINT, request_stop)
+            signal.signal(signal.SIGTERM, request_stop)
+            print(
+                "Paper bot running (public data, simulated orders only): "
+                f"session={args.session_id}, symbol={args.symbol}, "
+                f"interval={args.interval}"
+            )
+            trader.run_forever(stop)
+            print("Paper bot stopped cleanly.")
+            return 0
+        raise ValueError(f"Unsupported paper command: {args.paper_command}")
+    except Exception as error:
+        print(f"Paper command failed: {error}", file=sys.stderr)
+        LOGGER.debug("Paper command failure details", exc_info=True)
+        return 1
+
+
+def _print_paper_cycle(result) -> None:
+    print(
+        "Paper cycle: "
+        f"session={result.session_id}, processed={result.processed_candles}, "
+        f"backfilled={result.backfilled_candles}, "
+        f"live={result.live_candles}, fills={result.fills_created}, "
+        f"paused={str(result.trading_paused).lower()}"
+    )
+    print(result.message)
+
+
+def _print_paper_status(status) -> None:
+    print(
+        "Paper session: "
+        f"session={status.session_id}, "
+        f"checkpoint_sequence={status.checkpoint_sequence}, "
+        f"checkpoint_open_time={status.checkpoint_open_time}, "
+        f"paused={str(status.trading_paused).lower()}"
+    )
+    print(
+        f"quote_balance={status.quote_balance} "
+        f"base_balance={status.base_balance} "
+        f"realized_pnl={status.realized_pnl} "
+        f"fees_paid={status.fees_paid}"
+    )
+    print(
+        f"orders={status.order_count} fills={status.fill_count} "
+        f"reservations={status.reservation_count}"
+    )
 
 
 def _run_collect(
@@ -1041,7 +1187,175 @@ def _create_parser() -> argparse.ArgumentParser:
         metavar="PATH",
     )
 
+    paper_parser = subparsers.add_parser(
+        "paper",
+        help="run the persistent public-data paper-trading process",
+        description=(
+            "Operate deterministic Bybit Spot paper trading; no real "
+            "exchange orders or private APIs are used"
+        ),
+    )
+    paper_subparsers = paper_parser.add_subparsers(
+        dest="paper_command",
+        required=True,
+    )
+    for command, help_text in (
+        ("run", "run continuously until SIGINT or SIGTERM"),
+        ("run-once", "process all currently missing closed candles once"),
+        ("status", "recover and show the current paper-session state"),
+        ("integrity", "recover and verify all persistent session state"),
+    ):
+        command_parser = paper_subparsers.add_parser(
+            command,
+            help=help_text,
+        )
+        _add_paper_runtime_arguments(command_parser)
+    for command, help_text in (
+        ("pause", "block new BUY orders while allowing risk-reducing SELL"),
+        ("resume", "allow new BUY orders after a manual pause"),
+    ):
+        command_parser = paper_subparsers.add_parser(
+            command,
+            help=help_text,
+        )
+        command_parser.add_argument("--session-id", required=True)
+        command_parser.add_argument(
+            "--state-database",
+            type=Path,
+            default=Path("data/paper_state.db"),
+            metavar="PATH",
+        )
+        command_parser.add_argument(
+            "--verbose",
+            action="store_true",
+            help="show debug diagnostics on stderr",
+        )
+
     return parser
+
+
+def _add_paper_runtime_arguments(
+    command_parser: argparse.ArgumentParser,
+) -> None:
+    command_parser.add_argument("--session-id", required=True)
+    command_parser.add_argument(
+        "--strategy",
+        choices=("trend", "trend-pullback", "mean-reversion", "breakout"),
+        default="trend",
+    )
+    command_parser.add_argument("--symbol", default="BTCUSDT")
+    command_parser.add_argument("--interval", default="1h")
+    command_parser.add_argument(
+        "--market-database",
+        type=Path,
+        default=DEFAULT_DATABASE_PATH,
+        metavar="PATH",
+    )
+    command_parser.add_argument(
+        "--state-database",
+        type=Path,
+        default=Path("data/paper_state.db"),
+        metavar="PATH",
+    )
+    command_parser.add_argument(
+        "--warmup-candles",
+        type=_parse_positive_integer,
+        default=100,
+    )
+    command_parser.add_argument(
+        "--poll-seconds",
+        type=_parse_positive_integer,
+        default=60,
+    )
+    command_parser.add_argument(
+        "--fee-rate",
+        type=_parse_decimal_rate,
+        default=Decimal("0.001"),
+    )
+    command_parser.add_argument(
+        "--slippage-rate",
+        type=_parse_decimal_rate,
+        default=Decimal("0.0005"),
+    )
+    command_parser.add_argument(
+        "--position-size-fraction",
+        type=_parse_position_size_fraction,
+        default=None,
+    )
+    command_parser.add_argument(
+        "--maximum-order-notional",
+        type=_parse_positive_decimal,
+        default=Decimal("1000"),
+    )
+    command_parser.add_argument(
+        "--maximum-position-notional",
+        type=_parse_positive_decimal,
+        default=Decimal("1000"),
+    )
+    command_parser.add_argument(
+        "--maximum-total-exposure",
+        type=_parse_position_size_fraction,
+        default=Decimal("1"),
+    )
+    command_parser.add_argument(
+        "--minimum-available-cash",
+        type=_parse_non_negative_decimal,
+        default=Decimal("0"),
+    )
+    command_parser.add_argument(
+        "--maximum-daily-loss",
+        type=_parse_positive_decimal_rate,
+        default=Decimal("0.05"),
+    )
+    command_parser.add_argument(
+        "--maximum-portfolio-drawdown",
+        type=_parse_positive_decimal_rate,
+        default=Decimal("0.20"),
+    )
+    command_parser.add_argument(
+        "--data-freshness-seconds",
+        type=_parse_positive_integer,
+        default=300,
+    )
+    command_parser.add_argument(
+        "--quantity-step",
+        type=_parse_positive_decimal,
+        default=Decimal("0.00000001"),
+    )
+    command_parser.add_argument(
+        "--minimum-quantity",
+        type=_parse_positive_decimal,
+        default=Decimal("0.00001"),
+    )
+    command_parser.add_argument(
+        "--minimum-notional",
+        type=_parse_positive_decimal,
+        default=Decimal("5"),
+    )
+    command_parser.add_argument(
+        "--simulated-latency-ms",
+        type=_parse_nonnegative_integer,
+        default=0,
+    )
+    command_parser.add_argument(
+        "--partial-fill-fraction",
+        type=_parse_position_size_fraction,
+        default=Decimal("1"),
+        help="deterministic fraction of requested quantity filled immediately",
+    )
+    command_parser.add_argument(
+        "--keep-partial-order-open",
+        action="store_true",
+        help=(
+            "retain an unfilled remainder and its reservation for recovery "
+            "testing; no later fill is fabricated automatically"
+        ),
+    )
+    command_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show debug diagnostics on stderr",
+    )
 
 
 def _add_common_arguments(
@@ -1143,6 +1457,32 @@ def _parse_positive_decimal_rate(value: str) -> Decimal:
         raise argparse.ArgumentTypeError(
             "rate must be between 0 and 1"
         )
+    return result
+
+
+def _parse_positive_decimal(value: str) -> Decimal:
+    """Parse any finite Decimal greater than zero."""
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid decimal value: {value!r}"
+        ) from error
+    if not result.is_finite() or result <= 0:
+        raise argparse.ArgumentTypeError("value must be greater than zero")
+    return result
+
+
+def _parse_non_negative_decimal(value: str) -> Decimal:
+    """Parse any finite Decimal greater than or equal to zero."""
+    try:
+        result = Decimal(value)
+    except InvalidOperation as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid decimal value: {value!r}"
+        ) from error
+    if not result.is_finite() or result < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
     return result
 
 

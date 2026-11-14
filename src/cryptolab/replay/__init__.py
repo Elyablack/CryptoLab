@@ -2,8 +2,11 @@
 
 from cryptolab.replay.models import (
     DeterministicReplayReport,
+    ObservedCandleEvent,
+    PriceObservation,
     ReplayCandleResult,
     ReplayEvent,
+    ReplayExecutionMode,
     ReplayEventType,
     ReplayPortfolioSnapshot,
     ReplaySessionCheckpoint,
@@ -41,6 +44,8 @@ __all__ = [
     "DeterministicReplayReport",
     "DeterministicReplayRunner",
     "DeterministicReplaySession",
+    "ObservedCandleEvent",
+    "PriceObservation",
     "PersistentReplayRiskPolicy",
     "PersistentReplayRunner",
     "PersistentReplaySession",
@@ -48,6 +53,7 @@ __all__ = [
     "ReplayCandleResult",
     "ReplayConfigurationError",
     "ReplayEvent",
+    "ReplayExecutionMode",
     "ReplayEventType",
     "ReplayPortfolioSnapshot",
     "ReplayPersistenceError",

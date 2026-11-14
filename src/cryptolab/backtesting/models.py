@@ -85,7 +85,12 @@ class PortfolioState:
 
 @dataclass(frozen=True)
 class SimulatedFill:
-    """A deterministic fill at the next candle's adversely slipped open."""
+    """A deterministic adversely slipped strategy fill.
+
+    ``execution_open_time`` retains its legacy name. In batch backtests it is
+    the next candle open; observed-price paper replay stores the later public
+    price-observation execution timestamp in the same compatibility field.
+    """
 
     side: Signal
     signal_open_time: int

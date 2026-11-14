@@ -2,8 +2,8 @@
 
 CryptoLab v1.0 is a local, research-only platform for collecting and
 validating public cryptocurrency Spot candles, calculating indicators,
-generating deterministic research signals, and backtesting long-only virtual
-portfolios.
+generating deterministic research signals, backtesting long-only virtual
+portfolios, and running a local public-data paper simulation.
 
 It supports Binance Spot and Bybit V5 Spot. CryptoLab does not use private API
 keys, connect to exchange accounts, or submit real orders.
@@ -86,12 +86,37 @@ All date ranges use UTC and half-open semantics: `[start, end)`.
 | `research` | Compare strategies with buy-and-hold and cash benchmarks | No |
 | `optimize` | Run bounded chronological parameter research | No |
 | `signals-research` | Compare forward returns after signals with controls | No |
+| `paper` | Run or inspect persistent Bybit public-data paper simulation | Yes for `run`/`run-once` |
 
-Every command supports `--exchange {binance,bybit}`, `--symbol`, `--interval`,
-`--start`, `--end`, and `--database`. Binance remains the default exchange.
-Place `--verbose` after the subcommand to include debug diagnostics on stderr.
+Historical-data and research commands support `--exchange
+{binance,bybit}`, `--symbol`, `--interval`, `--start`, `--end`, and
+`--database`. Binance remains their default exchange. The `paper` command has
+its own explicit market/state paths and Stage 3 controls. Place `--verbose`
+after the selected subcommand to include debug diagnostics on stderr.
 
 Supported intervals are `1m`, `5m`, `15m`, `1h`, `4h`, and `1d`.
+
+## Continuous paper trading
+
+Stage 3 runs one existing strategy on Bybit Spot `BTCUSDT` `1h` with local
+virtual balances. It uses public REST only and cannot submit real orders.
+Historical gaps warm up the strategy without retroactive fills; only the
+newest fresh closed candle may use a separately observed public ticker price.
+
+```bash
+cryptolab paper run-once --session-id btc-trend-paper --strategy trend
+cryptolab paper run --session-id btc-trend-paper --strategy trend
+cryptolab paper status --session-id btc-trend-paper --strategy trend
+cryptolab paper pause --session-id btc-trend-paper
+cryptolab paper resume --session-id btc-trend-paper
+cryptolab paper integrity --session-id btc-trend-paper --strategy trend
+```
+
+The market database defaults to `data/market_data.db`; persistent process state
+defaults to `data/paper_state.db`. Use identical strategy, sizing, execution,
+fee/slippage, and risk arguments when recovering a session. See
+`docs/paper-bot-stage-3.md` for the exact time model, limits, migration,
+failure behavior, and simulation limitations.
 
 ## Reliable collection behavior
 

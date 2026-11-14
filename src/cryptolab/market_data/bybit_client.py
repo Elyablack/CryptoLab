@@ -12,6 +12,7 @@ class BybitSpotClient:
     """Fetch public Bybit V5 Spot klines without authentication."""
 
     KLINES_URL = "https://api.bybit.com/v5/market/kline"
+    TICKERS_URL = "https://api.bybit.com/v5/market/tickers"
     DEFAULT_TIMEOUT_SECONDS = 10.0
     INTERVALS = {
         "1m": "1",
@@ -72,6 +73,24 @@ class BybitSpotClient:
             exchange="bybit",
             url=self.KLINES_URL,
             params=params,
+            timeout=self._timeout,
+            transport=self._transport,
+            retry_policy=self._retry_policy,
+            retry_json_codes=frozenset({10006}),
+            **kwargs,
+        )
+
+    def get_ticker(self, symbol: str) -> Any:
+        """Return an unmodified public V5 Spot ticker response."""
+        kwargs: dict[str, object] = {}
+        if self._sleep is not None:
+            kwargs["sleep"] = self._sleep
+        if self._jitter is not None:
+            kwargs["jitter"] = self._jitter
+        return get_public_json(
+            exchange="bybit",
+            url=self.TICKERS_URL,
+            params={"category": "spot", "symbol": symbol},
             timeout=self._timeout,
             transport=self._transport,
             retry_policy=self._retry_policy,
