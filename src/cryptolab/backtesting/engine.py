@@ -396,9 +396,11 @@ class BacktestEngine:
     ) -> PortfolioBacktestReport:
         """Run aligned instruments against one shared USDT cash balance.
 
-        All streams must use the same interval and timestamp grid. Events at
-        the same candle open are processed by stable instrument/strategy key,
-        so capital allocation is explicit and repeated runs are identical.
+        All streams must use the same interval and timestamp grid. At one
+        candle open, SELL events release shared quote capital before BUY
+        events consume it; events on the same side retain stable
+        instrument/strategy order. This makes cross-asset rotations explicit
+        and deterministic.
         """
         if not inputs:
             raise ValueError("At least one portfolio input is required")
@@ -495,7 +497,16 @@ class BacktestEngine:
                 for _, _, instrument, rows, _ in prepared
             }
             if index > 0:
-                for _, _, instrument, _, decisions in prepared:
+                execution_order = sorted(
+                    prepared,
+                    key=lambda item: (
+                        self._portfolio_signal_priority(
+                            item[4][index - 1].signal,
+                        ),
+                        item[0],
+                    ),
+                )
+                for _, _, instrument, _, decisions in execution_order:
                     row = current_rows[instrument]
                     state = self._portfolio_state(accounting, instrument)
                     state, fill, new_trades, skip, intent = (
@@ -746,6 +757,15 @@ class BacktestEngine:
             orders=lifecycle.orders,
             execution_fills=lifecycle.fills,
         )
+
+    @staticmethod
+    def _portfolio_signal_priority(signal: Signal) -> int:
+        """Settle exits before entries sharing the same execution open."""
+        return {
+            Signal.SELL: 0,
+            Signal.HOLD: 1,
+            Signal.BUY: 2,
+        }[signal]
 
     def _execute_decision(
         self,

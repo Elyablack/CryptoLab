@@ -409,6 +409,20 @@ The iteration returned `NO CANDIDATE`: neither alternative passed the
 Development and Validation gates. See
 [Trading Edge Discovery — Iteration 1](docs/trading-edge-iteration-1.md).
 
+The next fixed experiment evaluates weekly BTC/ETH relative-momentum rotation
+with a 30-day lookback and the shared-USDT portfolio accounting:
+
+```bash
+python scripts/research_relative_momentum.py \
+  --database data/market_data.db
+```
+
+It reads existing Bybit Spot BTCUSDT and ETHUSDT 1h candles, performs quality
+checks, and makes no network requests. The primary 100% allocation failed the
+Validation return, drawdown, and concentration gates, so the result is
+`NO CANDIDATE`. The 50% allocation is a risk diagnostic only. See
+[Trading Edge Discovery — Iteration 2](docs/trading-edge-iteration-2.md).
+
 Further model limitations:
 
 - next-open execution is idealized;
@@ -479,5 +493,6 @@ See [architecture](docs/architecture.md),
 [signal event study](docs/signal-event-study.md),
 [Trend Pullback v1 research](docs/trend-pullback-v1.md),
 [Trading Edge Discovery — Iteration 1](docs/trading-edge-iteration-1.md),
+[Trading Edge Discovery — Iteration 2](docs/trading-edge-iteration-2.md),
 [ADR 0001](docs/decisions/0001-initial-architecture.md), and
 [ADR 0002](docs/decisions/0002-data-integrity-and-release.md).

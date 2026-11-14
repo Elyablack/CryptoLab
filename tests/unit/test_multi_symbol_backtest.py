@@ -119,6 +119,50 @@ def test_input_order_does_not_change_simultaneous_allocation() -> None:
     assert first == second
 
 
+def test_same_open_rotation_sells_before_buying_new_asset() -> None:
+    engine = BacktestEngine(
+        BacktestConfig(fee_rate=Decimal("0"), slippage_rate=Decimal("0")),
+    )
+    btc = PortfolioBacktestInput(
+        strategy=ScriptedStrategy(
+            "btc_rotation",
+            [Signal.HOLD, Signal.BUY, Signal.HOLD],
+        ),
+        symbol="BTCUSDT",
+        interval="1h",
+        rows=make_rows(["100", "100", "100"]),
+        exchange="bybit",
+    )
+    eth = PortfolioBacktestInput(
+        strategy=ScriptedStrategy(
+            "eth_rotation",
+            [Signal.BUY, Signal.SELL, Signal.HOLD],
+        ),
+        symbol="ETHUSDT",
+        interval="1h",
+        rows=make_rows(["50", "50", "50"]),
+        exchange="bybit",
+    )
+
+    report = engine.run_portfolio([btc, eth])
+
+    assert [fill.instrument.symbol for fill in report.fills] == [
+        "ETHUSDT",
+        "ETHUSDT",
+        "BTCUSDT",
+    ]
+    assert [fill.side for fill in report.fills] == [
+        Signal.BUY,
+        Signal.SELL,
+        Signal.BUY,
+    ]
+    assert report.final_quote_balance == 0
+    assert [position.instrument.symbol for position in report.positions] == [
+        "BTCUSDT",
+    ]
+    assert all(len(point.positions) <= 1 for point in report.equity_curve)
+
+
 def test_open_multi_symbol_positions_reconcile_equity() -> None:
     engine = BacktestEngine(
         BacktestConfig(fee_rate=Decimal("0"), slippage_rate=Decimal("0")),

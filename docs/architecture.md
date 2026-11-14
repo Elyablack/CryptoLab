@@ -77,6 +77,10 @@ The three baseline strategies remain Trend Following, Mean Reversion, and
 Breakout. `TrendPullbackStrategy` is an explicit research candidate selected
 with `--strategy trend-pullback`; it is intentionally excluded from the
 backward-compatible `--strategy all` set and the bounded parameter optimizer.
+`RelativeMomentumRotationPlanner` is a research-only cross-asset coordinator.
+It calculates fixed weekly BTC/ETH targets from current and prior closes, then
+exposes synchronized `RotationLegStrategy` adapters through the same strategy
+interface. It does not perform portfolio accounting.
 
 ### Backtesting
 
@@ -109,6 +113,12 @@ strategy action becomes an immutable `OrderIntent` with deterministic source
 and intent identifiers. `FixedFractionScaleSizer` enables explicit partial
 allocation without changing StrategyDecision.
 
+At one shared-portfolio open, `run_portfolio()` processes SELL before BUY and
+keeps stable instrument order within each side. A rotation can therefore
+release and reinvest USDT at the same next-open event without a duplicate
+accounting path. The ordering is deterministic and does not change
+single-symbol execution.
+
 `PortfolioAccounting` owns FIFO lots, partial realizations, fees, cost basis,
 position cycles, and realized/unrealized reconciliation. Scale-in adds a lot;
 scale-out consumes lots oldest first. The legacy sizer still rejects repeated
@@ -126,6 +136,12 @@ restart snapshots, and state reconciliation. Neither adapter performs I/O.
 `StrategyResearchRunner` runs unchanged strategies, deterministic benchmarks,
 and diagnostic condition counts. Generated reports and local databases are
 runtime artifacts rather than source fixtures.
+
+The standalone relative-momentum study builds one immutable synchronized plan
+for BTC and ETH, evaluates its two legs through `StrategyRunner` and
+`BacktestEngine.run_portfolio()`, and compares it with BTC, ETH, equal-weight,
+and cash benchmarks. Chronological periods start with fresh cash; pre-period
+rows are retained only for momentum lookback.
 
 `StrategyOptimizationRunner` builds features once, then applies immutable
 parameter sets to the existing strategy dataclasses. `PeriodRestrictedStrategy`

@@ -7,6 +7,14 @@ from cryptolab.strategies.breakout import (
 from cryptolab.strategies.mean_reversion import MeanReversionStrategy
 from cryptolab.strategies.models import Signal, StrategyDecision
 from cryptolab.strategies.runner import StrategyRunner
+from cryptolab.strategies.relative_momentum import (
+    RelativeMomentumRotationPlan,
+    RelativeMomentumRotationPlanner,
+    RotationLegSignal,
+    RotationLegStrategy,
+    RotationReview,
+    RotationTarget,
+)
 from cryptolab.strategies.trend_following import (
     TrendExitPolicy,
     TrendFollowingStrategy,
@@ -20,6 +28,12 @@ __all__ = [
     "BreakoutStrategy",
     "BreakoutEventPolicy",
     "MeanReversionStrategy",
+    "RelativeMomentumRotationPlan",
+    "RelativeMomentumRotationPlanner",
+    "RotationLegSignal",
+    "RotationLegStrategy",
+    "RotationReview",
+    "RotationTarget",
     "Signal",
     "StrategyDecision",
     "StrategyRunner",
