@@ -42,10 +42,13 @@ from cryptolab.market_data.markets import (
 from cryptolab.market_data.parser import parse_bybit_klines
 from cryptolab.paper import (
     ContinuousPaperTrader,
+    MultiSymbolPaperBotConfig,
+    MultiSymbolPaperTrader,
     PaperBotConfig,
     PaperExecutionConfig,
     PaperRiskConfig,
     set_paper_trading_pause,
+    set_portfolio_paper_trading_pause,
 )
 from cryptolab.research import StrategyResearchRunner
 from cryptolab.research.event_study import SignalEventStudyRunner
@@ -137,11 +140,16 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_paper(args: argparse.Namespace) -> int:
-    """Run or inspect the public-data-only Stage 3 paper process."""
+    """Run or inspect public-data-only single or portfolio paper trading."""
     try:
         if args.paper_command in ("pause", "resume"):
             paused = args.paper_command == "pause"
-            revision = set_paper_trading_pause(
+            pause = (
+                set_portfolio_paper_trading_pause
+                if args.mode == "multi"
+                else set_paper_trading_pause
+            )
+            revision = pause(
                 args.state_database,
                 args.session_id,
                 paused,
@@ -151,6 +159,9 @@ def _run_paper(args: argparse.Namespace) -> int:
                 f"session={args.session_id}, revision={revision}"
             )
             return 0
+
+        if args.mode == "multi":
+            return _run_multi_symbol_paper(args)
 
         strategies = _create_strategies(args.strategy)
         if len(strategies) != 1:
@@ -239,6 +250,87 @@ def _run_paper(args: argparse.Namespace) -> int:
         return 1
 
 
+def _run_multi_symbol_paper(args: argparse.Namespace) -> int:
+    """Dispatch the fixed BTC/ETH Rotation shared-USDT paper service."""
+    if args.strategy != "rotation":
+        raise ValueError(
+            "Multi-symbol paper mode requires --strategy rotation"
+        )
+    position_sizer: PositionSizer | None = None
+    if args.position_size_fraction is not None:
+        position_sizer = FixedFractionPositionSizer(
+            args.position_size_fraction
+        )
+    trader = MultiSymbolPaperTrader(
+        MultiSymbolPaperBotConfig(
+            session_id=args.session_id,
+            market_database=args.market_database,
+            state_database=args.state_database,
+            interval=args.interval,
+            warmup_candles=args.portfolio_warmup_candles,
+            poll_seconds=args.poll_seconds,
+        ),
+        backtest_config=BacktestConfig(
+            initial_cash=Decimal("1000"),
+            fee_rate=args.fee_rate,
+            slippage_rate=args.slippage_rate,
+        ),
+        risk_config=PaperRiskConfig(
+            maximum_order_notional=args.maximum_order_notional,
+            maximum_position_notional=args.maximum_position_notional,
+            maximum_total_exposure=args.maximum_total_exposure,
+            minimum_available_cash=args.minimum_available_cash,
+            maximum_daily_loss=args.maximum_daily_loss,
+            maximum_portfolio_drawdown=(
+                args.maximum_portfolio_drawdown
+            ),
+            data_freshness_limit_ms=args.data_freshness_seconds * 1000,
+        ),
+        execution_config=PaperExecutionConfig(
+            quantity_step=args.quantity_step,
+            minimum_quantity=args.minimum_quantity,
+            minimum_notional=args.minimum_notional,
+            simulated_latency_ms=args.simulated_latency_ms,
+            partial_fill_fraction=args.partial_fill_fraction,
+            cancel_unfilled_remainder=not args.keep_partial_order_open,
+        ),
+        position_sizer=position_sizer,
+    )
+    if args.paper_command == "run-once":
+        result = trader.run_once()
+        _print_portfolio_paper_cycle(result)
+        return 0 if result.reconciled else 1
+    if args.paper_command in ("status", "integrity"):
+        status = (
+            trader.check_integrity()
+            if args.paper_command == "integrity"
+            else trader.status()
+        )
+        _print_portfolio_paper_status(status)
+        if args.paper_command == "integrity":
+            print("Portfolio paper reconciliation: OK")
+        return 0 if status.reconciled else 1
+    if args.paper_command == "run":
+        stop = Event()
+
+        def request_stop(signum, frame) -> None:
+            del signum, frame
+            stop.set()
+
+        signal.signal(signal.SIGINT, request_stop)
+        signal.signal(signal.SIGTERM, request_stop)
+        print(
+            "Portfolio paper bot running (public data, simulated orders "
+            "only): "
+            f"session={args.session_id}, symbols=BTCUSDT,ETHUSDT, "
+            f"interval={args.interval}"
+        )
+        trader.run_forever(stop)
+        print("Portfolio paper bot stopped cleanly.")
+        return 0
+    raise ValueError(f"Unsupported paper command: {args.paper_command}")
+
+
 def _print_paper_cycle(result) -> None:
     print(
         "Paper cycle: "
@@ -268,6 +360,48 @@ def _print_paper_status(status) -> None:
         f"orders={status.order_count} fills={status.fill_count} "
         f"reservations={status.reservation_count}"
     )
+
+
+def _print_portfolio_paper_cycle(result) -> None:
+    print(
+        "Portfolio paper cycle: "
+        f"session={result.session_id}, "
+        f"sets={result.processed_candle_sets}, "
+        f"backfilled={result.backfilled_candle_sets}, "
+        f"live={result.live_candle_sets}, fills={result.fills_created}, "
+        f"target={result.rotation_target}, "
+        f"pending={result.pending_target}, "
+        f"paused={str(result.trading_paused).lower()}, "
+        f"reconciled={str(result.reconciled).lower()}"
+    )
+    print(result.message)
+
+
+def _print_portfolio_paper_status(status) -> None:
+    print(
+        "Portfolio paper session: "
+        f"session={status.session_id}, "
+        f"checkpoint_sequence={status.checkpoint_sequence}, "
+        f"checkpoint_revision={status.checkpoint_revision}, "
+        f"checkpoint_open_time={status.checkpoint_open_time}, "
+        f"target={status.rotation_target}, "
+        f"pending={status.pending_target}, "
+        f"phase={status.pending_phase}, "
+        f"paused={str(status.trading_paused).lower()}, "
+        f"reconciled={str(status.reconciled).lower()}"
+    )
+    print(
+        f"USDT={status.quote_balance} BTC={status.btc_balance} "
+        f"ETH={status.eth_balance} realized_pnl={status.realized_pnl} "
+        f"unrealized_pnl={status.unrealized_pnl} "
+        f"fees_paid={status.fees_paid}"
+    )
+    print(
+        f"orders={status.order_count} fills={status.fill_count} "
+        f"reservations={status.reservation_count}"
+    )
+    for diagnostic in status.reconciliation_diagnostics:
+        print(f"reconciliation: {diagnostic}")
 
 
 def _run_collect(
@@ -1220,6 +1354,12 @@ def _create_parser() -> argparse.ArgumentParser:
         )
         command_parser.add_argument("--session-id", required=True)
         command_parser.add_argument(
+            "--mode",
+            choices=("single", "multi"),
+            default="single",
+            help="single strategy session or shared BTC/ETH Rotation portfolio",
+        )
+        command_parser.add_argument(
             "--state-database",
             type=Path,
             default=Path("data/paper_state.db"),
@@ -1239,8 +1379,20 @@ def _add_paper_runtime_arguments(
 ) -> None:
     command_parser.add_argument("--session-id", required=True)
     command_parser.add_argument(
+        "--mode",
+        choices=("single", "multi"),
+        default="single",
+        help="single strategy session or shared BTC/ETH Rotation portfolio",
+    )
+    command_parser.add_argument(
         "--strategy",
-        choices=("trend", "trend-pullback", "mean-reversion", "breakout"),
+        choices=(
+            "trend",
+            "trend-pullback",
+            "mean-reversion",
+            "breakout",
+            "rotation",
+        ),
         default="trend",
     )
     command_parser.add_argument("--symbol", default="BTCUSDT")
@@ -1261,6 +1413,12 @@ def _add_paper_runtime_arguments(
         "--warmup-candles",
         type=_parse_positive_integer,
         default=100,
+    )
+    command_parser.add_argument(
+        "--portfolio-warmup-candles",
+        type=_parse_positive_integer,
+        default=721,
+        help="multi-symbol history; must exceed the fixed 720-hour lookback",
     )
     command_parser.add_argument(
         "--poll-seconds",

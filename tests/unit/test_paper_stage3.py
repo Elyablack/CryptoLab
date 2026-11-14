@@ -680,7 +680,7 @@ def test_schema_v1_migrates_controls_without_losing_session(tmp_path: Path) -> N
     assert repository.get_trading_paused("paper-test") is False
     assert repository.load_session("paper-test").checkpoint_sequence == 2
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
 
 
 def test_integrity_rejects_corrupt_manual_control_state(tmp_path: Path) -> None:

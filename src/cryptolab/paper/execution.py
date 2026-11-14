@@ -53,9 +53,9 @@ class PaperPositionSizer:
         if isinstance(proposed, BuySizingProposal):
             gross_notional = proposed.quote_budget / (ONE + context.fee_rate)
             raw_quantity = gross_notional / context.estimated_execution_price
-            quantity = _floor_step(raw_quantity, self.execution.quantity_step)
+            quantity = floor_to_step(raw_quantity, self.execution.quantity_step)
             notional = quantity * context.estimated_execution_price
-            fill_quantity = _floor_step(
+            fill_quantity = floor_to_step(
                 quantity * self.execution.partial_fill_fraction,
                 self.execution.quantity_step,
             )
@@ -70,11 +70,11 @@ class PaperPositionSizer:
                 reason=f"{proposed.reason}; rounded to paper quantity step",
             )
         if isinstance(proposed, SellSizingProposal):
-            quantity = _floor_step(
+            quantity = floor_to_step(
                 proposed.base_quantity,
                 self.execution.quantity_step,
             )
-            fill_quantity = _floor_step(
+            fill_quantity = floor_to_step(
                 quantity * self.execution.partial_fill_fraction,
                 self.execution.quantity_step,
             )
@@ -147,7 +147,7 @@ class PaperExecutionSimulator:
                 or not ZERO <= value < ONE
             ):
                 raise ValueError(f"{name} must be between 0 and 1")
-        requested_quantity = _floor_step(
+        requested_quantity = floor_to_step(
             intent.quantity,
             self.config.quantity_step,
         )
@@ -176,7 +176,7 @@ class PaperExecutionSimulator:
             reservation_amount=reservation,
             available_balance=available_balance,
         )
-        fill_quantity = _floor_step(
+        fill_quantity = floor_to_step(
             requested_quantity * self.config.partial_fill_fraction,
             self.config.quantity_step,
         )
@@ -274,6 +274,7 @@ class PaperExecutionSimulator:
             )
 
 
-def _floor_step(value: Decimal, step: Decimal) -> Decimal:
+def floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    """Round a positive quantity down to the configured venue step."""
     units = (value / step).to_integral_value(rounding=ROUND_DOWN)
     return units * step

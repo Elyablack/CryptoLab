@@ -385,7 +385,7 @@ def test_schema_is_versioned_and_decimal_payloads_are_strings(
     session.process_candle(make_candles()[0])
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         checkpoint = connection.execute(
             "SELECT checkpoint_json FROM paper_checkpoints"
         ).fetchone()[0]

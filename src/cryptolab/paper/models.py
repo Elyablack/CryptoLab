@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from decimal import Decimal
+from enum import Enum
 from pathlib import Path
 
 from cryptolab.market_data.intervals import get_interval_milliseconds
@@ -158,3 +159,131 @@ class PaperSessionStatus:
     fill_count: int
     reservation_count: int
     trading_paused: bool
+
+
+class RotationPhase(str, Enum):
+    """Durable progress through one SELL-before-BUY portfolio rotation."""
+
+    SELL = "sell"
+    BUY = "buy"
+
+
+@dataclass(frozen=True)
+class PendingRotation:
+    """Target transition that may span process restarts and poll cycles."""
+
+    target: str
+    source_candle_open_time: int
+    signal_available_time: int
+    phase: RotationPhase
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.target not in {"USDT", "BTCUSDT", "ETHUSDT"}:
+            raise ValueError("Unsupported pending rotation target")
+        for name in ("source_candle_open_time", "signal_available_time"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if self.signal_available_time <= self.source_candle_open_time:
+            raise ValueError("signal availability must follow candle open")
+        if not isinstance(self.phase, RotationPhase):
+            raise ValueError("phase must be a RotationPhase")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise ValueError("rotation reason must be non-empty")
+
+
+@dataclass(frozen=True)
+class MultiSymbolPaperBotConfig:
+    """Identity and scheduling for the fixed BTC/ETH Rotation portfolio."""
+
+    session_id: str
+    market_database: Path
+    state_database: Path
+    symbols: tuple[str, str] = ("BTCUSDT", "ETHUSDT")
+    interval: str = "1h"
+    exchange: str = "bybit"
+    market_type: str = "spot"
+    warmup_candles: int = 721
+    poll_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, str) or not self.session_id.strip():
+            raise ValueError("session_id must be non-empty")
+        if self.exchange != "bybit" or self.market_type != "spot":
+            raise ValueError("Multi-symbol paper supports Bybit Spot only")
+        if self.symbols != ("BTCUSDT", "ETHUSDT"):
+            raise ValueError(
+                "Multi-symbol paper requires BTCUSDT and ETHUSDT"
+            )
+        get_interval_milliseconds(self.interval)
+        if self.interval != "1h":
+            raise ValueError("Multi-symbol paper supports 1h only")
+        if type(self.warmup_candles) is not int or self.warmup_candles <= 0:
+            raise ValueError("warmup_candles must be positive")
+        if type(self.poll_seconds) is not int or self.poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+
+
+@dataclass(frozen=True)
+class PortfolioReconciliationReport:
+    """Persisted cross-check of lifecycle, fills, FIFO, and checkpoints."""
+
+    checked_at: int
+    consistent: bool
+    diagnostics: tuple[str, ...]
+    quote_balance: Decimal
+    btc_balance: Decimal
+    eth_balance: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    fees_paid: Decimal
+    order_count: int
+    fill_count: int
+    reservation_count: int
+    checkpoint_sequence: int
+    last_synchronized_open_time: int | None
+
+
+@dataclass(frozen=True)
+class MultiSymbolPaperCycleResult:
+    """One synchronized BTC/ETH polling-cycle outcome."""
+
+    session_id: str
+    checked_at: int
+    range_start: int | None
+    range_end: int | None
+    processed_candle_sets: int
+    backfilled_candle_sets: int
+    live_candle_sets: int
+    fills_created: int
+    rotation_target: str
+    pending_target: str | None
+    trading_paused: bool
+    reconciled: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class MultiSymbolPaperSessionStatus:
+    """Operator view of one shared-USDT paper portfolio."""
+
+    session_id: str
+    checkpoint_sequence: int
+    checkpoint_revision: int
+    checkpoint_open_time: int | None
+    quote_balance: Decimal
+    btc_balance: Decimal
+    eth_balance: Decimal
+    realized_pnl: Decimal
+    unrealized_pnl: Decimal
+    fees_paid: Decimal
+    order_count: int
+    fill_count: int
+    reservation_count: int
+    rotation_target: str
+    pending_target: str | None
+    pending_phase: str | None
+    trading_paused: bool
+    reconciled: bool
+    reconciliation_diagnostics: tuple[str, ...]

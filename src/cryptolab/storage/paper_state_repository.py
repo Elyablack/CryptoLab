@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,7 +24,7 @@ from cryptolab.replay.serialization import (
 )
 
 
-PAPER_STATE_SCHEMA_VERSION = 2
+PAPER_STATE_SCHEMA_VERSION = 3
 PAPER_STATE_SERIALIZATION_VERSION = 1
 
 
@@ -133,7 +134,76 @@ CREATE TABLE paper_controls (
     updated_at_utc TEXT NOT NULL,
     FOREIGN KEY (session_id) REFERENCES paper_sessions(session_id)
 );
+
+CREATE TABLE paper_portfolio_sessions (
+    session_id TEXT PRIMARY KEY,
+    schema_version INTEGER NOT NULL,
+    serialization_version INTEGER NOT NULL,
+    configuration_json TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE paper_portfolio_candles (
+    session_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    symbol TEXT NOT NULL,
+    open_time INTEGER NOT NULL,
+    payload TEXT NOT NULL,
+    PRIMARY KEY (session_id, symbol, open_time),
+    UNIQUE (session_id, sequence, symbol),
+    FOREIGN KEY (session_id) REFERENCES paper_portfolio_sessions(session_id)
+);
+
+CREATE TABLE paper_portfolio_checkpoints (
+    session_id TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    candle_sequence INTEGER NOT NULL,
+    last_open_time INTEGER,
+    checkpoint_json TEXT NOT NULL,
+    execution_json TEXT NOT NULL,
+    risk_state_json TEXT NOT NULL,
+    reconciled INTEGER NOT NULL CHECK (reconciled IN (0, 1)),
+    diagnostics_json TEXT NOT NULL,
+    committed_at_utc TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES paper_portfolio_sessions(session_id)
+);
+
+CREATE TABLE paper_portfolio_controls (
+    session_id TEXT PRIMARY KEY,
+    trading_paused INTEGER NOT NULL CHECK (trading_paused IN (0, 1)),
+    revision INTEGER NOT NULL,
+    updated_at_utc TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES paper_portfolio_sessions(session_id)
+);
+
+CREATE TABLE paper_portfolio_reconciliations (
+    session_id TEXT NOT NULL,
+    revision INTEGER NOT NULL,
+    checked_at INTEGER NOT NULL,
+    consistent INTEGER NOT NULL CHECK (consistent IN (0, 1)),
+    payload TEXT NOT NULL,
+    PRIMARY KEY (session_id, revision),
+    FOREIGN KEY (session_id) REFERENCES paper_portfolio_sessions(session_id)
+);
 """
+
+
+@dataclass(frozen=True)
+class StoredPortfolioPaperSession:
+    """Opaque durable state restored by the portfolio paper orchestrator."""
+
+    session_id: str
+    configuration_json: str
+    revision: int
+    candle_sequence: int
+    last_open_time: int | None
+    checkpoint_json: str
+    execution_json: str
+    risk_state_json: str
+    reconciled: bool
+    diagnostics_json: str
+    candles: tuple[tuple[int, str, int, str], ...]
 
 
 class PaperStateRepository:
@@ -166,7 +236,10 @@ class PaperStateRepository:
                 return
             if version == 1:
                 self._migrate_v1_to_v2(connection)
-                version = PAPER_STATE_SCHEMA_VERSION
+                version = 2
+            if version == 2:
+                self._migrate_v2_to_v3(connection)
+                version = 3
             if version != PAPER_STATE_SCHEMA_VERSION:
                 raise ReplayStateIntegrityError(
                     f"Unsupported paper-state schema version {version}; "
@@ -185,6 +258,11 @@ class PaperStateRepository:
                 "paper_execution_adapter",
                 "paper_checkpoints",
                 "paper_controls",
+                "paper_portfolio_sessions",
+                "paper_portfolio_candles",
+                "paper_portfolio_checkpoints",
+                "paper_portfolio_controls",
+                "paper_portfolio_reconciliations",
             }
             actual = {
                 row[0]
@@ -535,6 +613,346 @@ class PaperStateRepository:
             raise ReplayStateIntegrityError(
                 "Persistent execution snapshot is invalid"
             ) from error
+
+    def portfolio_session_exists(self, session_id: str) -> bool:
+        """Return whether a shared-cash portfolio session exists."""
+        self._validate_session_id(session_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM paper_portfolio_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
+    def create_portfolio_session(
+        self,
+        *,
+        session_id: str,
+        configuration_json: str,
+        checkpoint_json: str,
+        execution_json: str,
+        risk_state_json: str,
+        diagnostics_json: str,
+    ) -> None:
+        """Create an empty v3 portfolio session without touching legacy rows."""
+        self._validate_session_id(session_id)
+        now = _utc_now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO paper_portfolio_sessions (
+                        session_id, schema_version, serialization_version,
+                        configuration_json, created_at_utc, updated_at_utc
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        PAPER_STATE_SCHEMA_VERSION,
+                        PAPER_STATE_SERIALIZATION_VERSION,
+                        configuration_json,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO paper_portfolio_checkpoints (
+                        session_id, revision, candle_sequence, last_open_time,
+                        checkpoint_json, execution_json, risk_state_json,
+                        reconciled, diagnostics_json, committed_at_utc
+                    ) VALUES (?, 0, 0, NULL, ?, ?, ?, 1, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        checkpoint_json,
+                        execution_json,
+                        risk_state_json,
+                        diagnostics_json,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO paper_portfolio_controls (
+                        session_id, trading_paused, revision, updated_at_utc
+                    ) VALUES (?, 0, 0, ?)
+                    """,
+                    (session_id, now),
+                )
+                connection.execute("COMMIT")
+            except sqlite3.IntegrityError as error:
+                connection.execute("ROLLBACK")
+                raise ReplayStateIntegrityError(
+                    f"Portfolio paper session already exists: {session_id}"
+                ) from error
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    def commit_portfolio_state(
+        self,
+        *,
+        session_id: str,
+        checkpoint_json: str,
+        execution_json: str,
+        risk_state_json: str,
+        reconciled: bool,
+        diagnostics_json: str,
+        reconciliation_json: str,
+        reconciliation_checked_at: int,
+        candles: tuple[tuple[str, int, str], ...] = (),
+    ) -> int:
+        """Atomically persist a synchronized candle set and portfolio state."""
+        self._validate_session_id(session_id)
+        if type(reconciled) is not bool:
+            raise ValueError("reconciled must be a boolean")
+        if type(reconciliation_checked_at) is not int:
+            raise ValueError("reconciliation_checked_at must be an integer")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    """
+                    SELECT revision, candle_sequence, last_open_time
+                    FROM paper_portfolio_checkpoints WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    raise ReplayStateIntegrityError(
+                        f"Unknown portfolio paper session: {session_id}"
+                    )
+                revision = int(row[0]) + 1
+                candle_sequence = int(row[1])
+                last_open_time = row[2]
+                if candles:
+                    symbols = {item[0] for item in candles}
+                    open_times = {item[1] for item in candles}
+                    if symbols != {"BTCUSDT", "ETHUSDT"} or len(open_times) != 1:
+                        raise ReplayStateIntegrityError(
+                            "Portfolio checkpoint requires one aligned BTC/ETH set"
+                        )
+                    open_time = next(iter(open_times))
+                    expected_open = (
+                        open_time
+                        if last_open_time is None
+                        else int(last_open_time) + 3_600_000
+                    )
+                    if open_time != expected_open:
+                        raise ReplayStateIntegrityError(
+                            "Portfolio candle checkpoint is not consecutive"
+                        )
+                    candle_sequence += 1
+                    for symbol, item_open_time, payload in candles:
+                        existing = connection.execute(
+                            """
+                            SELECT sequence, payload
+                            FROM paper_portfolio_candles
+                            WHERE session_id = ? AND symbol = ? AND open_time = ?
+                            """,
+                            (session_id, symbol, item_open_time),
+                        ).fetchone()
+                        if existing is not None:
+                            if existing != (candle_sequence, payload):
+                                raise ReplayStateIntegrityError(
+                                    "Conflicting synchronized candle event"
+                                )
+                            continue
+                        connection.execute(
+                            """
+                            INSERT INTO paper_portfolio_candles (
+                                session_id, sequence, symbol, open_time, payload
+                            ) VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (
+                                session_id,
+                                candle_sequence,
+                                symbol,
+                                item_open_time,
+                                payload,
+                            ),
+                        )
+                    last_open_time = open_time
+                now = _utc_now()
+                connection.execute(
+                    """
+                    UPDATE paper_portfolio_checkpoints
+                    SET revision = ?, candle_sequence = ?, last_open_time = ?,
+                        checkpoint_json = ?, execution_json = ?,
+                        risk_state_json = ?, reconciled = ?,
+                        diagnostics_json = ?, committed_at_utc = ?
+                    WHERE session_id = ?
+                    """,
+                    (
+                        revision,
+                        candle_sequence,
+                        last_open_time,
+                        checkpoint_json,
+                        execution_json,
+                        risk_state_json,
+                        int(reconciled),
+                        diagnostics_json,
+                        now,
+                        session_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO paper_portfolio_reconciliations (
+                        session_id, revision, checked_at, consistent, payload
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        session_id,
+                        revision,
+                        reconciliation_checked_at,
+                        int(reconciled),
+                        reconciliation_json,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE paper_portfolio_sessions
+                    SET updated_at_utc = ? WHERE session_id = ?
+                    """,
+                    (now, session_id),
+                )
+                connection.execute("COMMIT")
+                return revision
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    def load_portfolio_session(
+        self,
+        session_id: str,
+    ) -> StoredPortfolioPaperSession:
+        """Load the latest portfolio checkpoint and immutable candle journal."""
+        self._validate_session_id(session_id)
+        with self._connect() as connection:
+            session = connection.execute(
+                """
+                SELECT configuration_json, schema_version, serialization_version
+                FROM paper_portfolio_sessions WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ReplayStateIntegrityError(
+                    f"Unknown portfolio paper session: {session_id}"
+                )
+            if session[1:] != (
+                PAPER_STATE_SCHEMA_VERSION,
+                PAPER_STATE_SERIALIZATION_VERSION,
+            ):
+                raise ReplayStateIntegrityError(
+                    "Stored portfolio schema/serialization is incompatible"
+                )
+            checkpoint = connection.execute(
+                """
+                SELECT revision, candle_sequence, last_open_time,
+                       checkpoint_json, execution_json, risk_state_json,
+                       reconciled, diagnostics_json
+                FROM paper_portfolio_checkpoints WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if checkpoint is None:
+                raise ReplayStateIntegrityError(
+                    "Portfolio paper session has no checkpoint"
+                )
+            candles = tuple(connection.execute(
+                """
+                SELECT sequence, symbol, open_time, payload
+                FROM paper_portfolio_candles
+                WHERE session_id = ? ORDER BY sequence, symbol
+                """,
+                (session_id,),
+            ).fetchall())
+        expected_rows = int(checkpoint[1]) * 2
+        if len(candles) != expected_rows:
+            raise ReplayStateIntegrityError(
+                "Portfolio candle journal does not match checkpoint"
+            )
+        for sequence in range(1, int(checkpoint[1]) + 1):
+            pair = [item for item in candles if item[0] == sequence]
+            if [item[1] for item in pair] != ["BTCUSDT", "ETHUSDT"]:
+                raise ReplayStateIntegrityError(
+                    "Portfolio candle journal is not synchronized"
+                )
+            if pair[0][2] != pair[1][2]:
+                raise ReplayStateIntegrityError(
+                    "Portfolio candle timestamps are misaligned"
+                )
+        if candles and candles[-1][2] != checkpoint[2]:
+            raise ReplayStateIntegrityError(
+                "Portfolio checkpoint timestamp does not match journal"
+            )
+        return StoredPortfolioPaperSession(
+            session_id=session_id,
+            configuration_json=session[0],
+            revision=checkpoint[0],
+            candle_sequence=checkpoint[1],
+            last_open_time=checkpoint[2],
+            checkpoint_json=checkpoint[3],
+            execution_json=checkpoint[4],
+            risk_state_json=checkpoint[5],
+            reconciled=bool(checkpoint[6]),
+            diagnostics_json=checkpoint[7],
+            candles=candles,
+        )
+
+    def set_portfolio_trading_paused(
+        self,
+        session_id: str,
+        paused: bool,
+    ) -> int:
+        self._validate_session_id(session_id)
+        if type(paused) is not bool:
+            raise ValueError("paused must be a boolean")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT revision FROM paper_portfolio_controls
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                connection.execute("ROLLBACK")
+                raise ReplayStateIntegrityError(
+                    f"Unknown portfolio paper session: {session_id}"
+                )
+            revision = int(row[0]) + 1
+            connection.execute(
+                """
+                UPDATE paper_portfolio_controls
+                SET trading_paused = ?, revision = ?, updated_at_utc = ?
+                WHERE session_id = ?
+                """,
+                (int(paused), revision, _utc_now(), session_id),
+            )
+            connection.execute("COMMIT")
+        return revision
+
+    def get_portfolio_trading_paused(self, session_id: str) -> bool:
+        self._validate_session_id(session_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT trading_paused, revision
+                FROM paper_portfolio_controls WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        if row is None or row[0] not in (0, 1) or int(row[1]) < 0:
+            raise ReplayStateIntegrityError(
+                "Invalid or missing portfolio trading control"
+            )
+        return bool(row[0])
 
     def _write_state(
         self,
@@ -924,6 +1342,78 @@ class PaperStateRepository:
                 "UPDATE paper_sessions SET schema_version = 2"
             )
             connection.execute("PRAGMA user_version = 2")
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v2_to_v3(connection: sqlite3.Connection) -> None:
+        """Add shared-portfolio state while preserving every Stage 1-3 row."""
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            statements = (
+                """CREATE TABLE IF NOT EXISTS paper_portfolio_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    serialization_version INTEGER NOT NULL,
+                    configuration_json TEXT NOT NULL,
+                    created_at_utc TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
+                )""",
+                """CREATE TABLE IF NOT EXISTS paper_portfolio_candles (
+                    session_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    symbol TEXT NOT NULL,
+                    open_time INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (session_id, symbol, open_time),
+                    UNIQUE (session_id, sequence, symbol),
+                    FOREIGN KEY (session_id)
+                        REFERENCES paper_portfolio_sessions(session_id)
+                )""",
+                """CREATE TABLE IF NOT EXISTS paper_portfolio_checkpoints (
+                    session_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    candle_sequence INTEGER NOT NULL,
+                    last_open_time INTEGER,
+                    checkpoint_json TEXT NOT NULL,
+                    execution_json TEXT NOT NULL,
+                    risk_state_json TEXT NOT NULL,
+                    reconciled INTEGER NOT NULL
+                        CHECK (reconciled IN (0, 1)),
+                    diagnostics_json TEXT NOT NULL,
+                    committed_at_utc TEXT NOT NULL,
+                    FOREIGN KEY (session_id)
+                        REFERENCES paper_portfolio_sessions(session_id)
+                )""",
+                """CREATE TABLE IF NOT EXISTS paper_portfolio_controls (
+                    session_id TEXT PRIMARY KEY,
+                    trading_paused INTEGER NOT NULL
+                        CHECK (trading_paused IN (0, 1)),
+                    revision INTEGER NOT NULL,
+                    updated_at_utc TEXT NOT NULL,
+                    FOREIGN KEY (session_id)
+                        REFERENCES paper_portfolio_sessions(session_id)
+                )""",
+                """CREATE TABLE IF NOT EXISTS paper_portfolio_reconciliations (
+                    session_id TEXT NOT NULL,
+                    revision INTEGER NOT NULL,
+                    checked_at INTEGER NOT NULL,
+                    consistent INTEGER NOT NULL
+                        CHECK (consistent IN (0, 1)),
+                    payload TEXT NOT NULL,
+                    PRIMARY KEY (session_id, revision),
+                    FOREIGN KEY (session_id)
+                        REFERENCES paper_portfolio_sessions(session_id)
+                )""",
+            )
+            for statement in statements:
+                connection.execute(statement)
+            connection.execute(
+                "UPDATE paper_sessions SET schema_version = 3"
+            )
+            connection.execute("PRAGMA user_version = 3")
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")
