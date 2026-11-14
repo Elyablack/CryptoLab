@@ -22,7 +22,7 @@ CLI
 │                                      ├── PositionSizer
 │                                      ├── OrderIntent → Order → Fill
 │                                      ├── FIFO PortfolioAccounting
-│                                      └── optional trailing stop
+│                                      └── optional trailing or fixed stop
 ├── research ─ quality ── StrategyResearchRunner
 │                        ├── three independent BacktestEngine runs
 │                        ├── buy-and-hold and cash-only
@@ -73,6 +73,11 @@ at the current row. Decisions include the signal candle, availability time,
 reference price, explanation, and immutable diagnostics. Strategy code has no
 access to exchange clients or portfolio state.
 
+The three baseline strategies remain Trend Following, Mean Reversion, and
+Breakout. `TrendPullbackStrategy` is an explicit research candidate selected
+with `--strategy trend-pullback`; it is intentionally excluded from the
+backward-compatible `--strategy all` set and the bounded parameter optimizer.
+
 ### Backtesting
 
 `BacktestEngine.run()` evaluates one strategy and one independent virtual
@@ -83,6 +88,10 @@ capital allocation. It executes signals at the next open, applies
 Decimal fees and slippage, retains an equity curve, and asserts accounting
 invariants. Optional trailing-stop fills share the normal SELL settlement path
 and use risk-source intents without fabricated strategy timestamps.
+An optional fixed protective stop uses the same settlement path and is
+anchored to the actual entry fill. It checks the current candle open and low,
+so its fill is an OHLC execution-model event rather than a fabricated strategy
+decision. Fixed and trailing stops are mutually exclusive.
 
 Strategy decisions remain quantity-free. At an eligible next-open event a
 `PositionSizer` approves either a quote budget for BUY or a base quantity for
@@ -243,6 +252,8 @@ state if any migration step fails.
 - FIFO lot quantity, remaining cost, fees, and realizations reconcile after
   every accounting event.
 - Trailing high updates only after the current candle stop check.
+- An entry-relative fixed stop is active after the BUY fill, including the
+  entry candle; strategy SELL at the open has priority over the stop check.
 - Optimization ranking never reads holdout metrics; feature rows after a
   period's `end_time` are removed by the existing `as_of_time` boundary.
 - Event-study outcomes never cross a chronological boundary, and future

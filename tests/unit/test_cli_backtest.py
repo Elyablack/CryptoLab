@@ -82,6 +82,7 @@ def test_backtest_help(capsys: pytest.CaptureFixture[str]) -> None:
     assert "--fee-rate" in output
     assert "--show-trades" in output
     assert "--trailing-stop-rate" in output
+    assert "--stop-loss-rate" in output
     assert "--position-size-fraction" in output
     assert "--position-sell-fraction" in output
     assert "--portfolio-symbol" in output
@@ -176,6 +177,30 @@ def test_backtest_accepts_optional_trailing_stop_rate(
     output = capsys.readouterr().out
     assert "Trailing stop:    10.0000%" in output
     assert "Trailing exits:   0" in output
+
+
+def test_backtest_accepts_pullback_strategy_with_fixed_stop(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    database_path = tmp_path / "market_data.db"
+    save_bybit_candles(database_path, make_hourly_candles(72))
+    arguments = backtest_arguments(database_path)
+    arguments.extend([
+        "--strategy",
+        "trend-pullback",
+        "--stop-loss-rate",
+        "0.03",
+    ])
+
+    exit_code = main(arguments)
+
+    assert exit_code == 0
+    output = capsys.readouterr().out
+    assert output.count("CryptoLab Backtest") == 1
+    assert "Strategy:         trend_pullback_v1" in output
+    assert "Protective stop:  3.0000%" in output
+    assert "Protective exits: 0" in output
 
 
 def test_backtest_accepts_position_size_fraction(
@@ -432,6 +457,81 @@ def test_backtest_rejects_invalid_trailing_stop_rate(
             "2024-01-04",
             "--trailing-stop-rate",
             trailing_stop_rate,
+        ])
+
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    "stop_loss_rate",
+    ["invalid", "0", "-0.1", "1", "NaN", "Infinity"],
+)
+def test_backtest_rejects_invalid_stop_loss_rate(
+    stop_loss_rate: str,
+) -> None:
+    with pytest.raises(SystemExit) as error:
+        main([
+            "backtest",
+            "--exchange",
+            "bybit",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "1h",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-04",
+            "--stop-loss-rate",
+            stop_loss_rate,
+        ])
+
+    assert error.value.code == 2
+
+
+def test_backtest_rejects_trailing_and_fixed_stops_together() -> None:
+    with pytest.raises(SystemExit) as error:
+        main([
+            "backtest",
+            "--exchange",
+            "bybit",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "1h",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-04",
+            "--trailing-stop-rate",
+            "0.05",
+            "--stop-loss-rate",
+            "0.03",
+        ])
+
+    assert error.value.code == 2
+
+
+def test_backtest_rejects_fixed_stop_with_scale_in_policy() -> None:
+    with pytest.raises(SystemExit) as error:
+        main([
+            "backtest",
+            "--exchange",
+            "bybit",
+            "--symbol",
+            "BTCUSDT",
+            "--interval",
+            "1h",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-04",
+            "--position-size-fraction",
+            "0.25",
+            "--position-sell-fraction",
+            "0.5",
+            "--stop-loss-rate",
+            "0.03",
         ])
 
     assert error.value.code == 2

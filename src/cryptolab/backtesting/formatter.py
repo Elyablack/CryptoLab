@@ -11,6 +11,7 @@ from cryptolab.backtesting.accounting import (
 )
 from cryptolab.backtesting.models import (
     BacktestReport,
+    ProtectiveStopFill,
     SimulatedFill,
     TrailingStopFill,
 )
@@ -45,6 +46,11 @@ def format_backtest_report(
             "Trailing stop:    "
             f"{report.config.trailing_stop_rate * 100:.4f}%"
         )
+    if report.config.stop_loss_rate is not None:
+        execution_model.append(
+            "Protective stop:  "
+            f"{report.config.stop_loss_rate * 100:.4f}%"
+        )
 
     activity = [
         f"Fills:            {len(report.fills)}",
@@ -59,6 +65,12 @@ def format_backtest_report(
             for fill in report.fills
         )
         activity.append(f"Trailing exits:   {trailing_exits}")
+    if report.config.stop_loss_rate is not None:
+        protective_exits = sum(
+            isinstance(fill, ProtectiveStopFill)
+            for fill in report.fills
+        )
+        activity.append(f"Protective exits: {protective_exits}")
 
     lines = [
         "CryptoLab Backtest",
@@ -129,6 +141,11 @@ def format_portfolio_backtest_report(
         execution_model.append(
             "Trailing stop:    "
             f"{report.config.trailing_stop_rate * 100:.4f}%"
+        )
+    if report.config.stop_loss_rate is not None:
+        execution_model.append(
+            "Protective stop:  "
+            f"{report.config.stop_loss_rate * 100:.4f}%"
         )
 
     lines = [
@@ -216,7 +233,7 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
                     f"{_format_timestamp(exit_fill.execution_open_time)}"
                 ),
             ]
-        else:
+        elif isinstance(exit_fill, TrailingStopFill):
             exit_details = [
                 (
                     "  Exit trailing stop: "
@@ -226,6 +243,21 @@ def _format_trade_details(report: BacktestReport) -> list[str]:
                 (
                     "  Stop levels: high_watermark="
                     f"{exit_fill.high_watermark} USDT, "
+                    f"active_stop={exit_fill.active_stop_price} USDT, "
+                    "market_reference="
+                    f"{exit_fill.market_reference_price} USDT"
+                ),
+            ]
+        else:
+            exit_details = [
+                (
+                    "  Exit protective stop: "
+                    f"trigger={exit_fill.trigger_kind.value}, candle="
+                    f"{_format_timestamp(exit_fill.trigger_candle_open_time)}"
+                ),
+                (
+                    "  Stop levels: entry_execution="
+                    f"{exit_fill.entry_execution_price} USDT, "
                     f"active_stop={exit_fill.active_stop_price} USDT, "
                     "market_reference="
                     f"{exit_fill.market_reference_price} USDT"
@@ -326,9 +358,14 @@ def _format_portfolio_trade_details(
                 f"{_format_timestamp(exit_fill.signal_available_time)}, "
                 f"executed={_format_timestamp(exit_fill.execution_open_time)}"
             )
-        else:
+        elif isinstance(exit_fill, TrailingStopFill):
             exit_event = (
                 f"trailing {exit_fill.trigger_kind.value}, candle="
+                f"{_format_timestamp(exit_fill.trigger_candle_open_time)}"
+            )
+        else:
+            exit_event = (
+                f"protective stop {exit_fill.trigger_kind.value}, candle="
                 f"{_format_timestamp(exit_fill.trigger_candle_open_time)}"
             )
         lines.extend([

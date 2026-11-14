@@ -26,6 +26,7 @@ class BacktestConfig:
     fee_rate: Decimal = Decimal("0.001")
     slippage_rate: Decimal = Decimal("0.0005")
     trailing_stop_rate: Decimal | None = None
+    stop_loss_rate: Decimal | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -50,6 +51,19 @@ class BacktestConfig:
             or not Decimal("0") < self.trailing_stop_rate < 1
         ):
             raise ValueError("trailing_stop_rate must be between 0 and 1")
+        if self.stop_loss_rate is not None and (
+            not isinstance(self.stop_loss_rate, Decimal)
+            or not self.stop_loss_rate.is_finite()
+            or not Decimal("0") < self.stop_loss_rate < 1
+        ):
+            raise ValueError("stop_loss_rate must be between 0 and 1")
+        if (
+            self.trailing_stop_rate is not None
+            and self.stop_loss_rate is not None
+        ):
+            raise ValueError(
+                "trailing_stop_rate and stop_loss_rate cannot be combined"
+            )
 
 
 @dataclass(frozen=True)
@@ -90,6 +104,13 @@ class TrailingStopTriggerKind(str, Enum):
     INTRABAR = "intrabar"
 
 
+class ProtectiveStopTriggerKind(str, Enum):
+    """How a fixed protective stop was crossed within an OHLC candle."""
+
+    GAP_OPEN = "gap_open"
+    INTRABAR = "intrabar"
+
+
 @dataclass(frozen=True)
 class TrailingStopFill:
     """A stop-market SELL without fabricated strategy signal timestamps."""
@@ -114,7 +135,31 @@ class TrailingStopFill:
         return Signal.SELL
 
 
-Fill = SimulatedFill | TrailingStopFill
+@dataclass(frozen=True)
+class ProtectiveStopFill:
+    """A fixed entry-relative stop without strategy signal timestamps."""
+
+    trigger_kind: ProtectiveStopTriggerKind
+    trigger_candle_open_time: int
+    entry_execution_price: Decimal
+    active_stop_price: Decimal
+    market_reference_price: Decimal
+    execution_price: Decimal
+    base_quantity: Decimal
+    quote_notional: Decimal
+    fee: Decimal
+    quote_balance_after: Decimal
+    base_balance_after: Decimal
+    fill_id: str | None = None
+    instrument: Instrument | None = None
+    intent_id: str | None = None
+
+    @property
+    def side(self) -> Signal:
+        return Signal.SELL
+
+
+Fill = SimulatedFill | TrailingStopFill | ProtectiveStopFill
 
 
 @dataclass(frozen=True)

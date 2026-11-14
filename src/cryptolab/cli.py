@@ -63,6 +63,7 @@ from cryptolab.strategies import (
     Signal,
     StrategyRunner,
     TrendFollowingStrategy,
+    TrendPullbackStrategy,
 )
 from cryptolab.strategies.base import Strategy
 
@@ -442,6 +443,7 @@ def _run_backtest(
             BacktestConfig(
                 fee_rate=args.fee_rate,
                 trailing_stop_rate=args.trailing_stop_rate,
+                stop_loss_rate=args.stop_loss_rate,
             ),
             position_sizer=position_sizer,
         )
@@ -781,7 +783,13 @@ def _create_parser() -> argparse.ArgumentParser:
     _add_common_arguments(signals_parser)
     signals_parser.add_argument(
         "--strategy",
-        choices=("all", "trend", "mean-reversion", "breakout"),
+        choices=(
+            "all",
+            "trend",
+            "trend-pullback",
+            "mean-reversion",
+            "breakout",
+        ),
         default="all",
     )
 
@@ -796,7 +804,13 @@ def _create_parser() -> argparse.ArgumentParser:
     _add_common_arguments(backtest_parser)
     backtest_parser.add_argument(
         "--strategy",
-        choices=("all", "trend", "mean-reversion", "breakout"),
+        choices=(
+            "all",
+            "trend",
+            "trend-pullback",
+            "mean-reversion",
+            "breakout",
+        ),
         default="all",
     )
     backtest_parser.add_argument(
@@ -842,6 +856,16 @@ def _create_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="DECIMAL",
         help="optional trailing-stop fraction, for example 0.05 = 5%%",
+    )
+    backtest_parser.add_argument(
+        "--stop-loss-rate",
+        type=_parse_positive_decimal_rate,
+        default=None,
+        metavar="DECIMAL",
+        help=(
+            "optional fixed protective stop relative to actual entry price; "
+            "cannot be combined with --trailing-stop-rate"
+        ),
     )
     backtest_parser.add_argument(
         "--position-size-fraction",
@@ -953,7 +977,13 @@ def _create_parser() -> argparse.ArgumentParser:
     _add_common_arguments(signal_research_parser)
     signal_research_parser.add_argument(
         "--strategy",
-        choices=("all", "trend", "mean-reversion", "breakout"),
+        choices=(
+            "all",
+            "trend",
+            "trend-pullback",
+            "mean-reversion",
+            "breakout",
+        ),
         default="all",
     )
     signal_research_parser.add_argument(
@@ -1154,6 +1184,20 @@ def _validate_backtest_arguments(
 ) -> None:
     """Reject combinations whose allocation semantics would be ambiguous."""
     if (
+        args.trailing_stop_rate is not None
+        and args.stop_loss_rate is not None
+    ):
+        parser.error(
+            "--trailing-stop-rate and --stop-loss-rate cannot be combined"
+        )
+    if (
+        args.stop_loss_rate is not None
+        and args.position_sell_fraction is not None
+    ):
+        parser.error(
+            "--stop-loss-rate does not support scale-in/scale-out sizing"
+        )
+    if (
         args.position_sell_fraction is not None
         and args.position_size_fraction is None
     ):
@@ -1305,11 +1349,16 @@ def _load_backtest_rows(
 def _create_strategies(strategy_name: str) -> list[Strategy]:
     strategies = {
         "trend": TrendFollowingStrategy,
+        "trend-pullback": TrendPullbackStrategy,
         "mean-reversion": MeanReversionStrategy,
         "breakout": BreakoutStrategy,
     }
     if strategy_name == "all":
-        return [factory() for factory in strategies.values()]
+        return [
+            TrendFollowingStrategy(),
+            MeanReversionStrategy(),
+            BreakoutStrategy(),
+        ]
 
     return [strategies[strategy_name]()]
 

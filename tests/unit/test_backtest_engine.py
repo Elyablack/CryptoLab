@@ -7,6 +7,9 @@ import pytest
 from cryptolab.backtesting import (
     BacktestConfig,
     BacktestEngine,
+    FixedFractionScaleSizer,
+    ProtectiveStopFill,
+    ProtectiveStopTriggerKind,
     SimulatedFill,
     TrailingStopFill,
     TrailingStopTriggerKind,
@@ -616,6 +619,145 @@ def test_detailed_report_identifies_trailing_stop_exit() -> None:
     assert "Exit signal available/execution" not in output
 
 
+def test_fixed_protective_stop_triggers_intrabar_on_entry_candle() -> None:
+    rows = make_rows(["100", "100"], closes=["100", "99"])
+    rows[1] = replace(rows[1], high=Decimal("102"), low=Decimal("96"))
+    strategy = ScriptedStrategy([Signal.BUY, Signal.HOLD])
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        stop_loss_rate=Decimal("0.03"),
+    )).run(strategy, "BTCUSDT", "1h", rows)
+
+    assert len(report.fills) == 2
+    stop = report.fills[1]
+    assert isinstance(stop, ProtectiveStopFill)
+    assert stop.trigger_kind is ProtectiveStopTriggerKind.INTRABAR
+    assert stop.entry_execution_price == Decimal("100")
+    assert stop.active_stop_price == Decimal("97.00")
+    assert stop.market_reference_price == Decimal("97.00")
+    assert stop.execution_price == Decimal("97.00")
+    assert not hasattr(stop, "signal_open_time")
+    assert report.final_equity == Decimal("970.00")
+    assert report.completed_trades[0].pnl == Decimal("-30.00")
+
+
+def test_gap_through_fixed_stop_executes_at_open() -> None:
+    rows = make_rows(
+        ["100", "100", "90"],
+        closes=["100", "101", "92"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("102"), low=Decimal("98"))
+    rows[2] = replace(rows[2], high=Decimal("94"), low=Decimal("88"))
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        stop_loss_rate=Decimal("0.03"),
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.HOLD, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    stop = report.fills[1]
+    assert isinstance(stop, ProtectiveStopFill)
+    assert stop.trigger_kind is ProtectiveStopTriggerKind.GAP_OPEN
+    assert stop.active_stop_price == Decimal("97.00")
+    assert stop.market_reference_price == Decimal("90")
+    assert stop.execution_price == Decimal("90")
+    assert report.final_equity == Decimal("900")
+
+
+def test_pending_strategy_sell_has_priority_over_fixed_stop() -> None:
+    rows = make_rows(
+        ["100", "100", "96"],
+        closes=["100", "101", "94"],
+    )
+    rows[1] = replace(rows[1], high=Decimal("102"), low=Decimal("98"))
+    rows[2] = replace(rows[2], high=Decimal("98"), low=Decimal("90"))
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        stop_loss_rate=Decimal("0.03"),
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.SELL, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    assert len(report.fills) == 2
+    assert isinstance(report.fills[1], SimulatedFill)
+    assert report.fills[1].execution_price == Decimal("96")
+    assert not any(isinstance(fill, ProtectiveStopFill) for fill in report.fills)
+
+
+def test_fixed_stop_uses_existing_fee_slippage_and_formatter() -> None:
+    rows = make_rows(["100", "100"], closes=["100", "95"])
+    rows[1] = replace(rows[1], high=Decimal("101"), low=Decimal("90"))
+    report = BacktestEngine(BacktestConfig(
+        stop_loss_rate=Decimal("0.03"),
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+    stop = report.fills[1]
+    assert isinstance(stop, ProtectiveStopFill)
+    entry_price = Decimal("100") * Decimal("1.0005")
+    active_stop = entry_price * Decimal("0.97")
+    exit_price = active_stop * Decimal("0.9995")
+    assert stop.entry_execution_price == entry_price
+    assert stop.active_stop_price == active_stop
+    assert stop.execution_price == exit_price
+    assert report.realized_pnl == report.completed_trades[0].pnl
+    assert report.fees_paid == sum(
+        (fill.fee for fill in report.fills),
+        Decimal("0"),
+    )
+    output = format_backtest_report(report, show_trades=True)
+    assert "Protective stop:  3.0000%" in output
+    assert "Protective exits: 1" in output
+    assert "Exit protective stop: trigger=intrabar" in output
+
+
+def test_fixed_stop_state_resets_for_a_later_reentry() -> None:
+    rows = make_rows(["100", "100", "100"], closes=["100", "99", "99"])
+    rows[1] = replace(rows[1], high=Decimal("101"), low=Decimal("96"))
+    rows[2] = replace(rows[2], high=Decimal("101"), low=Decimal("96"))
+    report = BacktestEngine(BacktestConfig(
+        fee_rate=Decimal("0"),
+        slippage_rate=Decimal("0"),
+        stop_loss_rate=Decimal("0.03"),
+    )).run(
+        ScriptedStrategy([Signal.BUY, Signal.BUY, Signal.HOLD]),
+        "BTCUSDT",
+        "1h",
+        rows,
+    )
+
+    assert len(report.completed_trades) == 2
+    assert [type(fill) for fill in report.fills] == [
+        SimulatedFill,
+        ProtectiveStopFill,
+        SimulatedFill,
+        ProtectiveStopFill,
+    ]
+
+
+def test_fixed_stop_rejects_ambiguous_scale_in_accounting() -> None:
+    with pytest.raises(ValueError, match="does not support scale-in"):
+        BacktestEngine(
+            BacktestConfig(stop_loss_rate=Decimal("0.03")),
+            position_sizer=FixedFractionScaleSizer(
+                buy_fraction=Decimal("0.5"),
+                sell_fraction=Decimal("0.5"),
+            ),
+        )
+
+
 class InvalidSignalStrategy:
     name = "invalid_signal"
     minimum_history = 1
@@ -696,6 +838,14 @@ def test_invalid_feature_rows_are_rejected(
         {"trailing_stop_rate": Decimal("1")},
         {"trailing_stop_rate": Decimal("NaN")},
         {"trailing_stop_rate": Decimal("Infinity")},
+        {"stop_loss_rate": Decimal("0")},
+        {"stop_loss_rate": Decimal("-0.01")},
+        {"stop_loss_rate": Decimal("1")},
+        {"stop_loss_rate": Decimal("NaN")},
+        {
+            "trailing_stop_rate": Decimal("0.1"),
+            "stop_loss_rate": Decimal("0.03"),
+        },
     ],
 )
 def test_backtest_config_rejects_invalid_accounting_parameters(

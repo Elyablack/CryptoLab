@@ -15,6 +15,8 @@ from cryptolab.backtesting.models import (
     EquityPoint,
     Fill,
     PortfolioState,
+    ProtectiveStopFill,
+    ProtectiveStopTriggerKind,
     SimulatedFill,
     SkippedDecision,
     TrailingStopFill,
@@ -64,6 +66,13 @@ class _TrailingStopState:
     high_watermark: Decimal
 
 
+@dataclass(frozen=True)
+class _ProtectiveStopState:
+    """Fixed stop anchored to the actual entry execution price."""
+
+    entry_execution_price: Decimal
+
+
 class BacktestEngine:
     """Evaluate one strategy with one independent virtual Spot portfolio."""
 
@@ -80,6 +89,13 @@ class BacktestEngine:
             or not self._position_sizer.name.strip()
         ):
             raise ValueError("Position sizer name must be a non-empty string")
+        if (
+            self._config.stop_loss_rate is not None
+            and getattr(self._position_sizer, "allows_scale_in", False)
+        ):
+            raise ValueError(
+                "stop_loss_rate does not support scale-in position sizing"
+            )
 
     def run(
         self,
@@ -135,6 +151,7 @@ class BacktestEngine:
         source_event_ids: set[str] = set()
         fills_by_id: dict[str, SimulatedFill] = {}
         trailing_stop_state: _TrailingStopState | None = None
+        protective_stop_state: _ProtectiveStopState | None = None
 
         for index, row in enumerate(eligible_rows):
             if index > 0:
@@ -175,8 +192,17 @@ class BacktestEngine:
                             trailing_stop_state = _TrailingStopState(
                                 high_watermark=fill.execution_price,
                             )
+                        if self._config.stop_loss_rate is not None:
+                            if protective_stop_state is not None:
+                                raise RuntimeError(
+                                    "Protective stop already has an entry state"
+                                )
+                            protective_stop_state = _ProtectiveStopState(
+                                entry_execution_price=fill.execution_price,
+                            )
                     elif state.base_balance == 0:
                         trailing_stop_state = None
+                        protective_stop_state = None
                 trades.extend(new_trades)
                 if skip is not None:
                     skipped.append(skip)
@@ -215,6 +241,38 @@ class BacktestEngine:
                             row.high,
                         ),
                     )
+
+            if (
+                self._config.stop_loss_rate is not None
+                and state.base_balance > 0
+            ):
+                if protective_stop_state is None:
+                    raise RuntimeError(
+                        "Open position has no protective-stop state"
+                    )
+                stop_result = self._execute_protective_stop(
+                    row,
+                    state,
+                    protective_stop_state,
+                    instrument,
+                    accounting,
+                    fills_by_id,
+                    lifecycle,
+                )
+                if stop_result is not None:
+                    state, stop_fill, stop_trades, stop_intent = stop_result
+                    if stop_intent.intent_id in intent_ids:
+                        raise RuntimeError("Duplicate protective-stop intent")
+                    if stop_intent.source_event_id in source_event_ids:
+                        raise RuntimeError(
+                            "Duplicate protective-stop source event"
+                        )
+                    intent_ids.add(stop_intent.intent_id)
+                    source_event_ids.add(stop_intent.source_event_id)
+                    order_intents.append(stop_intent)
+                    fills.append(stop_fill)
+                    trades.extend(stop_trades)
+                    protective_stop_state = None
 
             equity_curve.append(self._mark_equity(row, state))
 
@@ -366,6 +424,7 @@ class BacktestEngine:
         source_event_ids: set[str] = set()
         fills_by_id: dict[str, SimulatedFill] = {}
         trailing_states: dict[Instrument, _TrailingStopState] = {}
+        protective_states: dict[Instrument, _ProtectiveStopState] = {}
         equity_curve: list[PortfolioEquityPoint] = []
 
         for index in range(len(reference_timeline)):
@@ -417,8 +476,21 @@ class BacktestEngine:
                                 trailing_states[instrument] = _TrailingStopState(
                                     high_watermark=fill.execution_price,
                                 )
+                            if self._config.stop_loss_rate is not None:
+                                if instrument in protective_states:
+                                    raise RuntimeError(
+                                        "Protective stop already has entry state"
+                                    )
+                                protective_states[instrument] = (
+                                    _ProtectiveStopState(
+                                        entry_execution_price=(
+                                            fill.execution_price
+                                        ),
+                                    )
+                                )
                         elif state.base_balance == 0:
                             trailing_states.pop(instrument, None)
+                            protective_states.pop(instrument, None)
                     trades.extend(new_trades)
                     if skip is not None:
                         skipped.append(skip)
@@ -460,6 +532,42 @@ class BacktestEngine:
                                 row.high,
                             ),
                         )
+
+            if self._config.stop_loss_rate is not None:
+                for _, _, instrument, _, _ in prepared:
+                    state = self._portfolio_state(accounting, instrument)
+                    if state.base_balance == 0:
+                        continue
+                    protective_state = protective_states.get(instrument)
+                    if protective_state is None:
+                        raise RuntimeError(
+                            "Open position has no protective-stop state"
+                        )
+                    row = current_rows[instrument]
+                    stop_result = self._execute_protective_stop(
+                        row,
+                        state,
+                        protective_state,
+                        instrument,
+                        accounting,
+                        fills_by_id,
+                        lifecycle,
+                    )
+                    if stop_result is None:
+                        continue
+                    _, stop_fill, stop_trades, stop_intent = stop_result
+                    if stop_intent.intent_id in intent_ids:
+                        raise RuntimeError("Duplicate protective-stop intent")
+                    if stop_intent.source_event_id in source_event_ids:
+                        raise RuntimeError(
+                            "Duplicate protective-stop source event"
+                        )
+                    intent_ids.add(stop_intent.intent_id)
+                    source_event_ids.add(stop_intent.source_event_id)
+                    intents.append(stop_intent)
+                    fills.append(stop_fill)
+                    trades.extend(stop_trades)
+                    del protective_states[instrument]
 
             mark_prices = {
                 instrument: row.close
@@ -796,6 +904,62 @@ class BacktestEngine:
             raise RuntimeError("Trailing stop fill has no order intent")
         return new_state, fill, trades, intent
 
+    def _execute_protective_stop(
+        self,
+        row: FeatureRow,
+        state: PortfolioState,
+        protective_state: _ProtectiveStopState,
+        instrument: Instrument,
+        accounting: PortfolioAccounting,
+        fills_by_id: dict[str, SimulatedFill],
+        lifecycle: ExecutionAdapter,
+    ) -> tuple[
+        PortfolioState,
+        ProtectiveStopFill,
+        tuple[CompletedTrade, ...],
+        OrderIntent,
+    ] | None:
+        rate = self._config.stop_loss_rate
+        if rate is None:
+            return None
+        active_stop_price = protective_state.entry_execution_price * (
+            Decimal("1") - rate
+        )
+        if row.open <= active_stop_price:
+            trigger_kind = ProtectiveStopTriggerKind.GAP_OPEN
+            market_reference_price = row.open
+        elif row.low <= active_stop_price:
+            trigger_kind = ProtectiveStopTriggerKind.INTRABAR
+            market_reference_price = active_stop_price
+        else:
+            return None
+
+        intent = self._protective_stop_intent(
+            instrument,
+            row,
+            state.base_balance,
+            trigger_kind,
+        )
+        new_state, fill, trades = self._settle_sell(
+            row=row,
+            state=state,
+            instrument=instrument,
+            accounting=accounting,
+            fills_by_id=fills_by_id,
+            lifecycle=lifecycle,
+            base_quantity=state.base_balance,
+            market_reference_price=market_reference_price,
+            intent=intent,
+            protective_state=protective_state,
+            active_stop_price=active_stop_price,
+            protective_trigger_kind=trigger_kind,
+        )
+        if not isinstance(fill, ProtectiveStopFill):
+            raise RuntimeError("Protective stop produced an unexpected fill")
+        if fill.intent_id is None:
+            raise RuntimeError("Protective stop fill has no order intent")
+        return new_state, fill, trades, intent
+
     def _settle_sell(
         self,
         *,
@@ -812,6 +976,8 @@ class BacktestEngine:
         trailing_state: _TrailingStopState | None = None,
         active_stop_price: Decimal | None = None,
         trigger_kind: TrailingStopTriggerKind | None = None,
+        protective_state: _ProtectiveStopState | None = None,
+        protective_trigger_kind: ProtectiveStopTriggerKind | None = None,
     ) -> tuple[PortfolioState, Fill, tuple[CompletedTrade, ...]]:
         """Apply one SELL through the shared FIFO accounting path."""
         if intent is None:
@@ -820,14 +986,27 @@ class BacktestEngine:
             decision is not None
             and intent.source is IntentSource.STRATEGY
         )
-        is_stop_exit = all(
+        is_trailing_exit = all(
             value is not None
             for value in (trailing_state, active_stop_price, trigger_kind)
         )
-        if is_strategy_exit == is_stop_exit:
+        is_protective_exit = all(
+            value is not None
+            for value in (
+                protective_state,
+                active_stop_price,
+                protective_trigger_kind,
+            )
+        )
+        if sum((is_strategy_exit, is_trailing_exit, is_protective_exit)) != 1:
             raise RuntimeError("SELL must have exactly one execution source")
-        if is_stop_exit and intent.source is not IntentSource.TRAILING_STOP:
+        if (
+            is_trailing_exit
+            and intent.source is not IntentSource.TRAILING_STOP
+        ):
             raise RuntimeError("Trailing stop requires a trailing-stop intent")
+        if is_protective_exit and intent.source is not IntentSource.RISK:
+            raise RuntimeError("Protective stop requires a risk intent")
 
         execution_price = market_reference_price * (
             Decimal("1") - self._config.slippage_rate
@@ -868,7 +1047,7 @@ class BacktestEngine:
                 intent,
                 fill_id,
             )
-        else:
+        elif is_trailing_exit:
             if (
                 trailing_state is None
                 or active_stop_price is None
@@ -879,6 +1058,31 @@ class BacktestEngine:
                 trigger_kind=trigger_kind,
                 trigger_candle_open_time=row.open_time,
                 high_watermark=trailing_state.high_watermark,
+                active_stop_price=active_stop_price,
+                market_reference_price=market_reference_price,
+                execution_price=execution_price,
+                base_quantity=base_quantity,
+                quote_notional=quote_notional,
+                fee=fee,
+                quote_balance_after=new_state.quote_balance,
+                base_balance_after=new_state.base_balance,
+                fill_id=fill_id,
+                instrument=instrument,
+                intent_id=intent.intent_id,
+            )
+        else:
+            if (
+                protective_state is None
+                or active_stop_price is None
+                or protective_trigger_kind is None
+            ):
+                raise RuntimeError("Protective-stop metadata is incomplete")
+            fill = ProtectiveStopFill(
+                trigger_kind=protective_trigger_kind,
+                trigger_candle_open_time=row.open_time,
+                entry_execution_price=(
+                    protective_state.entry_execution_price
+                ),
                 active_stop_price=active_stop_price,
                 market_reference_price=market_reference_price,
                 execution_price=execution_price,
@@ -1116,6 +1320,38 @@ class BacktestEngine:
             source_candle_open_time=row.open_time,
             explanation=(
                 "position-level trailing stop closed the remaining position"
+            ),
+        )
+
+    @staticmethod
+    def _protective_stop_intent(
+        instrument: Instrument,
+        row: FeatureRow,
+        quantity: Decimal,
+        trigger_kind: ProtectiveStopTriggerKind,
+    ) -> OrderIntent:
+        source_event_id = ":".join((
+            "protective-stop",
+            instrument.exchange,
+            instrument.market_type,
+            instrument.symbol,
+            str(row.open_time),
+            trigger_kind.value,
+        ))
+        return OrderIntent(
+            intent_id=f"{source_event_id}:intent",
+            source_event_id=source_event_id,
+            source=IntentSource.RISK,
+            instrument=instrument,
+            side=OrderSide.SELL,
+            quantity=quantity,
+            created_at=row.open_time,
+            earliest_execution_at=row.open_time,
+            signal_available_time=None,
+            source_candle_open_time=row.open_time,
+            explanation=(
+                "fixed entry-relative protective stop closed the remaining "
+                "position"
             ),
         )
 

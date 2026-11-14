@@ -360,6 +360,42 @@ modeled at the active stop before slippage. The current candle high updates the
 watermark only after the stop check. Hourly OHLC does not reveal the exact
 intrabar path or fill time.
 
+### Trend Pullback v1 candidate
+
+`trend-pullback` is an opt-in research candidate for BTCUSDT 1h. It is not
+included in `--strategy all`, does not replace any baseline strategy, and is
+not part of the bounded optimizer. Its predeclared rules look for an EMA20
+pullback inside a rising SMA20/SMA50 trend, followed by price, RSI, relative
+volume, and ATR confirmation. A trend-structure break emits a normal Spot
+SELL event.
+
+The candidate is evaluated with a fixed 3% entry-relative protective stop:
+
+```bash
+cryptolab backtest \
+  --exchange bybit \
+  --symbol BTCUSDT \
+  --interval 1h \
+  --start 2023-11-01 \
+  --end 2026-11-01 \
+  --database data/market_data.db \
+  --strategy trend-pullback \
+  --stop-loss-rate 0.03 \
+  --show-trades
+```
+
+The stop is anchored to the actual BUY execution price. It is active on the
+entry candle, exits a later gap at that candle's open, and otherwise models an
+intrabar crossing at the stop price before adverse slippage. A pending
+strategy SELL at the candle open has priority. The fixed stop and trailing
+stop cannot be enabled together, and fixed-stop runs currently use the legacy
+single-entry position model rather than scale-in allocation.
+
+The fixed v1 rules were rejected by exploratory research; they were not tuned
+after observing the result. See
+[Trend Pullback v1 research](docs/trend-pullback-v1.md) for the exact rules,
+period results, and limitations.
+
 Further model limitations:
 
 - next-open execution is idealized;
@@ -428,5 +464,6 @@ headers.
 See [architecture](docs/architecture.md),
 [strategy optimization](docs/strategy-optimization.md),
 [signal event study](docs/signal-event-study.md),
+[Trend Pullback v1 research](docs/trend-pullback-v1.md),
 [ADR 0001](docs/decisions/0001-initial-architecture.md), and
 [ADR 0002](docs/decisions/0002-data-integrity-and-release.md).
