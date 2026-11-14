@@ -142,6 +142,13 @@ uses `BacktestExecutionSession`, a stateful wrapper around the existing
 fills, FIFO accounting, fees, and PnL are not reimplemented. Replay-specific
 scope and limitations are documented in `docs/paper-bot-stage-1.md`.
 
+`PersistentReplayRunner` optionally wraps this loop with a separate versioned
+SQLite paper-state database. A complete candle event, journal updates, order
+lifecycle, fills, reservations, FIFO/accounting state, risk state, and
+checkpoint commit atomically. Recovery replays committed candles through the
+same execution path and requires exact agreement with every normalized stored
+table. Details are in `docs/paper-bot-stage-2.md`.
+
 ### Research
 
 `StrategyResearchRunner` runs unchanged strategies, deterministic benchmarks,
@@ -328,7 +335,8 @@ current implementation authenticates or communicates with a trading endpoint.
 - no scheduler or monitoring service;
 - machine-readable research output is available for optimization and signal
   event-study reports;
-- no authenticated paper/testnet/live venue adapter or durable order store;
+- no authenticated paper/testnet/live venue adapter or durable external-venue
+  order store;
 - multi-symbol backtests require aligned timelines, one strategy, and a
   common exchange/interval/USDT balance;
 - backtests do not model order books or exchange quantity filters.

@@ -39,6 +39,7 @@ from cryptolab.replay.models import (
     ReplayEventType,
     ReplayMetadataValue,
     ReplayPortfolioSnapshot,
+    ReplaySessionCheckpoint,
 )
 from cryptolab.replay.risk import (
     AllowAllReplayRiskPolicy,
@@ -206,6 +207,33 @@ class DeterministicReplaySession:
     @property
     def snapshots(self) -> tuple[ReplayPortfolioSnapshot, ...]:
         return tuple(self._snapshots)
+
+    @property
+    def candle_event_ids(self) -> tuple[str, ...]:
+        return tuple(self._candle_event_order)
+
+    def checkpoint(self) -> ReplaySessionCheckpoint:
+        """Return state at the last fully processed in-memory candle."""
+        if self._final_report is not None:
+            raise RuntimeError("Replay session is already finalized")
+        return ReplaySessionCheckpoint(
+            exchange=self._exchange,
+            market_type=self._market_type,
+            symbol=self._symbol,
+            interval=self._interval,
+            strategy_name=self._strategy.name,
+            position_sizer_name=self._execution.position_sizer_name,
+            risk_policy_name=self._risk_policy.name,
+            config=self._config,
+            candles=tuple(self._candles),
+            candle_event_ids=tuple(self._candle_event_order),
+            decisions=tuple(self._decisions),
+            events=tuple(self._events),
+            snapshots=tuple(self._snapshots),
+            equity_curve=tuple(self._equity_curve),
+            execution=self._execution.checkpoint(),
+            clock_time=self._clock.now,
+        )
 
     def process_candle(
         self,

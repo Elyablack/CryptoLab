@@ -82,3 +82,17 @@ Stage 1 supports only normal next-open strategy decisions. Stop and timed-exit
 models remain batch-only because they require explicit current-candle path
 events; an incremental session rejects those configurations instead of
 changing their semantics implicitly.
+
+## Persistent replay recovery
+
+`PersistentReplayRunner` stores each complete replay candle boundary in a
+separate versioned SQLite database. The input event, decisions, intents,
+orders, fills, reservations, adapter snapshot, FIFO/accounting snapshot, risk
+state, and checkpoint share one transaction. A pre-commit failure invalidates
+the current process handle; recovery starts from the last committed candle.
+
+Recovery does not assign stored balances directly. It reprocesses the durable
+candle stream through the normal replay, execution adapter, lifecycle, and
+portfolio accounting services, then compares the reconstructed objects with
+the persisted state. Any mismatch fails closed. Identical event retries are
+no-ops, while conflicting payloads using an existing ID are integrity errors.

@@ -7,6 +7,8 @@ from decimal import Decimal
 from cryptolab.backtesting.accounting import (
     LotRealization,
     PortfolioAccounting,
+    PositionCycle,
+    PositionLot,
 )
 from cryptolab.backtesting.models import (
     BacktestConfig,
@@ -48,8 +50,10 @@ from cryptolab.execution.models import (
 )
 from cryptolab.execution.adapter import (
     ExecutionAdapter,
+    ExecutionEvent,
     SimulatedExecutionAdapter,
 )
+from cryptolab.execution.lifecycle import BalanceReservation
 from cryptolab.features.models import FeatureRow
 from cryptolab.market_data.markets import (
     DEFAULT_EXCHANGE,
@@ -91,6 +95,24 @@ class StrategyExecutionOutcome:
     completed_trades: tuple[CompletedTrade, ...]
     skipped_decision: SkippedDecision | None
     order_intent: OrderIntent | None
+
+
+@dataclass(frozen=True)
+class BacktestExecutionCheckpoint:
+    """Immutable incremental execution state for persistence and audit."""
+
+    state: PortfolioState
+    fills: tuple[SimulatedFill, ...]
+    completed_trades: tuple[CompletedTrade, ...]
+    skipped_decisions: tuple[SkippedDecision, ...]
+    order_intents: tuple[OrderIntent, ...]
+    orders: tuple[Order, ...]
+    execution_fills: tuple[ExecutionFill, ...]
+    reservations: tuple[BalanceReservation, ...]
+    execution_events: tuple[ExecutionEvent, ...]
+    open_lots: tuple[PositionLot, ...]
+    lot_realizations: tuple[LotRealization, ...]
+    position_cycles: tuple[PositionCycle, ...]
 
 
 class BacktestEngine:
@@ -1954,6 +1976,45 @@ class BacktestExecutionSession:
     @property
     def execution_fills(self) -> tuple[ExecutionFill, ...]:
         return self._lifecycle.fills
+
+    @property
+    def reservations(self) -> tuple[BalanceReservation, ...]:
+        return self._lifecycle.reservations
+
+    def checkpoint(self) -> BacktestExecutionCheckpoint:
+        """Return validated state without finalizing the execution session."""
+        self._ensure_active()
+        self._accounting.assert_invariants()
+        state = self.state
+        self._engine._assert_non_negative(state)
+        if state.fees_paid != sum(
+            (fill.fee for fill in self._fills),
+            Decimal("0"),
+        ):
+            raise RuntimeError("Incremental fill fees do not reconcile")
+        if state.realized_pnl != sum(
+            (trade.pnl for trade in self._trades),
+            Decimal("0"),
+        ):
+            raise RuntimeError("Incremental realized PnL does not reconcile")
+        if len(self._lifecycle.orders) != len(self._intents):
+            raise RuntimeError("Incremental orders and intents do not reconcile")
+        if len(self._lifecycle.fills) != len(self._fills):
+            raise RuntimeError("Incremental execution fills do not reconcile")
+        return BacktestExecutionCheckpoint(
+            state=state,
+            fills=tuple(self._fills),
+            completed_trades=tuple(self._trades),
+            skipped_decisions=tuple(self._skipped),
+            order_intents=tuple(self._intents),
+            orders=self._lifecycle.orders,
+            execution_fills=self._lifecycle.fills,
+            reservations=self._lifecycle.reservations,
+            execution_events=self._lifecycle.events,
+            open_lots=self._accounting.all_lots(),
+            lot_realizations=self._accounting.realizations,
+            position_cycles=self._accounting.cycles,
+        )
 
     def prepare_sizing(
         self,

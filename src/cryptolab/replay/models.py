@@ -6,8 +6,16 @@ from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
 
-from cryptolab.backtesting.engine import StrategyExecutionOutcome
-from cryptolab.backtesting.models import BacktestReport, PortfolioState
+from cryptolab.backtesting.engine import (
+    BacktestExecutionCheckpoint,
+    StrategyExecutionOutcome,
+)
+from cryptolab.backtesting.models import (
+    BacktestConfig,
+    BacktestReport,
+    EquityPoint,
+    PortfolioState,
+)
 from cryptolab.market_data.models import Candle
 from cryptolab.strategies.models import StrategyDecision
 
@@ -102,4 +110,26 @@ class DeterministicReplayReport:
     @property
     def final_equity(self) -> Decimal:
         return self.backtest.final_equity
+
+
+@dataclass(frozen=True)
+class ReplaySessionCheckpoint:
+    """Complete immutable state at a processed-candle boundary."""
+
+    exchange: str
+    market_type: str
+    symbol: str
+    interval: str
+    strategy_name: str
+    position_sizer_name: str
+    risk_policy_name: str
+    config: BacktestConfig
+    candles: tuple[Candle, ...]
+    candle_event_ids: tuple[str, ...]
+    decisions: tuple[StrategyDecision, ...]
+    events: tuple[ReplayEvent, ...]
+    snapshots: tuple[ReplayPortfolioSnapshot, ...]
+    equity_curve: tuple[EquityPoint, ...]
+    execution: BacktestExecutionCheckpoint
+    clock_time: int | None
 

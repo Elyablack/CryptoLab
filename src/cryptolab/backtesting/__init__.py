@@ -6,6 +6,7 @@ from cryptolab.backtesting.benchmarks import (
 )
 from cryptolab.backtesting.engine import (
     BacktestEngine,
+    BacktestExecutionCheckpoint,
     BacktestExecutionSession,
     StrategyExecutionOutcome,
 )
@@ -50,6 +51,7 @@ from cryptolab.backtesting.sizing import (
 __all__ = [
     "BacktestConfig",
     "BacktestEngine",
+    "BacktestExecutionCheckpoint",
     "BacktestExecutionSession",
     "BacktestReport",
     "BenchmarkReport",

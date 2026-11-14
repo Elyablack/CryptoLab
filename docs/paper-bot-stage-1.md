@@ -211,10 +211,10 @@ tolerance or float conversion is used.
   quadratic feature-calculation work;
 - the risk policy is only an extension point, not a production risk manager.
 
-## Required before Stage 2
+## Stage 2 handoff
 
-Stage 2 should be specified separately. Likely prerequisites are an
-incremental indicator state with parity tests, a durable and versioned event
-store, atomic recovery checkpoints for order/accounting state, explicit
-restart and reconciliation rules, and a controlled market-data event source.
-None of those capabilities is implied or implemented by Stage 1.
+Stage 1 itself contains no durable state. The separately implemented Stage 2
+wrapper adds a versioned event store, atomic order/accounting checkpoints, and
+explicit restart reconciliation without changing this in-memory API. See
+`docs/paper-bot-stage-2.md`. A controlled network market-data source and
+incremental indicator state remain outside both stages.
