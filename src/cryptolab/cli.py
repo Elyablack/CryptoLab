@@ -39,6 +39,12 @@ from cryptolab.market_data.markets import (
 )
 from cryptolab.market_data.parser import parse_bybit_klines
 from cryptolab.research import StrategyResearchRunner
+from cryptolab.research.event_study import SignalEventStudyRunner
+from cryptolab.research.event_study_formatter import (
+    format_signal_event_study,
+    signal_event_study_to_csv,
+    signal_event_study_to_json,
+)
 from cryptolab.research.formatter import format_research_report
 from cryptolab.research.optimization import StrategyOptimizationRunner
 from cryptolab.research.optimization_formatter import (
@@ -77,6 +83,8 @@ def main(argv: list[str] | None = None) -> int:
         _validate_backtest_arguments(parser, args)
     if args.command == "optimize":
         _validate_optimize_arguments(parser, args)
+    if args.command == "signals-research":
+        _validate_optimize_arguments(parser, args)
 
     start_time = int(args.start.timestamp() * 1000)
     end_time = int(args.end.timestamp() * 1000)
@@ -102,6 +110,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "optimize":
         return _run_optimize(args, start_time, end_time, database_path)
+
+    if args.command == "signals-research":
+        return _run_signals_research(
+            args,
+            start_time,
+            end_time,
+            database_path,
+        )
 
     parser.error(f"unsupported command: {args.command}")
     return 2
@@ -640,6 +656,84 @@ def _run_optimize(
     return 0
 
 
+def _run_signals_research(
+    args: argparse.Namespace,
+    start_time: int,
+    end_time: int,
+    database_path: Path,
+) -> int:
+    """Study forward price behavior after locally generated signals."""
+    try:
+        if not database_path.is_file():
+            raise FileNotFoundError(
+                f"Database does not exist: {database_path}"
+            )
+        repository = SQLiteRepository(database_path)
+        repository.init_schema()
+        quality = DataQualityChecker(repository).check(
+            symbol=args.symbol,
+            interval=args.interval,
+            start_time=start_time,
+            end_time=end_time,
+            as_of_time=end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        if not quality.is_valid:
+            raise ValueError(
+                "Cannot study signals on invalid historical data: "
+                f"missing={quality.missing_candles}, "
+                f"unexpected={quality.unexpected_candles}, "
+                f"duplicates={quality.duplicate_candles}, "
+                f"invalid={quality.invalid_candles}"
+            )
+        candles = repository.get_candles_by_range(
+            args.symbol,
+            args.interval,
+            start_time,
+            end_time,
+            **_market_identity_kwargs(args.exchange),
+        )
+        report = SignalEventStudyRunner().run(
+            args.symbol,
+            args.interval,
+            candles,
+            strategies=_create_strategies(args.strategy),
+            exchange=args.exchange,
+            market_type=SPOT_MARKET_TYPE,
+            as_of_time=end_time,
+            train_fraction=args.train_fraction,
+            validation_fraction=args.validation_fraction,
+            fee_rate=args.fee_rate,
+            slippage_rate=args.slippage_rate,
+            random_seed=args.random_seed,
+            bootstrap_samples=args.bootstrap_samples,
+            minimum_independent_events=args.minimum_independent_events,
+        )
+        if args.output_json is not None:
+            args.output_json.parent.mkdir(parents=True, exist_ok=True)
+            args.output_json.write_text(
+                signal_event_study_to_json(report),
+                encoding="utf-8",
+            )
+        if args.output_csv is not None:
+            args.output_csv.parent.mkdir(parents=True, exist_ok=True)
+            args.output_csv.write_text(
+                signal_event_study_to_csv(report),
+                encoding="utf-8",
+            )
+    except Exception as error:
+        print(f"Signal research failed: {error}", file=sys.stderr)
+        LOGGER.debug("Signal-research failure details", exc_info=True)
+        return 1
+
+    print(format_signal_event_study(report))
+    if args.output_json is not None:
+        print(f"JSON report: {args.output_json}")
+    if args.output_csv is not None:
+        print(f"CSV report: {args.output_csv}")
+    return 0
+
+
 def _create_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -842,6 +936,75 @@ def _create_parser() -> argparse.ArgumentParser:
         metavar="PATH",
     )
     optimize_parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        metavar="PATH",
+    )
+
+    signal_research_parser = subparsers.add_parser(
+        "signals-research",
+        help="study forward returns after historical research signals",
+        description=(
+            "Compare signal-following returns with deterministic matched "
+            "controls; no portfolio or exchange orders are created"
+        ),
+    )
+    _add_common_arguments(signal_research_parser)
+    signal_research_parser.add_argument(
+        "--strategy",
+        choices=("all", "trend", "mean-reversion", "breakout"),
+        default="all",
+    )
+    signal_research_parser.add_argument(
+        "--fee-rate",
+        type=_parse_decimal_rate,
+        default=Decimal("0.001"),
+        metavar="DECIMAL",
+    )
+    signal_research_parser.add_argument(
+        "--slippage-rate",
+        type=_parse_decimal_rate,
+        default=Decimal("0.0005"),
+        metavar="DECIMAL",
+    )
+    signal_research_parser.add_argument(
+        "--train-fraction",
+        type=_parse_positive_decimal_rate,
+        default=Decimal("0.6"),
+        metavar="DECIMAL",
+    )
+    signal_research_parser.add_argument(
+        "--validation-fraction",
+        type=_parse_positive_decimal_rate,
+        default=Decimal("0.2"),
+        metavar="DECIMAL",
+    )
+    signal_research_parser.add_argument(
+        "--random-seed",
+        type=int,
+        default=20261114,
+        metavar="INTEGER",
+    )
+    signal_research_parser.add_argument(
+        "--bootstrap-samples",
+        type=_parse_positive_integer,
+        default=1000,
+        metavar="COUNT",
+    )
+    signal_research_parser.add_argument(
+        "--minimum-independent-events",
+        type=_parse_positive_integer,
+        default=20,
+        metavar="COUNT",
+    )
+    signal_research_parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        metavar="PATH",
+    )
+    signal_research_parser.add_argument(
         "--output-csv",
         type=Path,
         default=None,

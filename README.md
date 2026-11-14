@@ -69,6 +69,7 @@ cryptolab signals  --exchange bybit --symbol BTCUSDT --interval 1h --start 2025-
 cryptolab backtest --exchange bybit --symbol BTCUSDT --interval 1h --start 2025-01-01 --end 2025-02-01 --database data/market_data.db --strategy all --show-trades
 cryptolab research --exchange bybit --symbol BTCUSDT --interval 1h --start 2025-01-01 --end 2025-02-01 --database data/market_data.db --fee-rate 0.001
 cryptolab optimize --exchange bybit --symbol BTCUSDT --interval 1h --start 2023-11-01 --end 2026-11-01 --database data/market_data.db --strategy all --output-json reports/optimization.json --output-csv reports/optimization.csv
+cryptolab signals-research --exchange bybit --symbol BTCUSDT --interval 1h --start 2023-11-01 --end 2026-11-01 --database data/market_data.db --strategy all --output-json reports/signal-study.json --output-csv reports/signal-study.csv
 ```
 
 All date ranges use UTC and half-open semantics: `[start, end)`.
@@ -84,6 +85,7 @@ All date ranges use UTC and half-open semantics: `[start, end)`.
 | `backtest` | Simulate independent long-only Spot portfolios | No |
 | `research` | Compare strategies with buy-and-hold and cash benchmarks | No |
 | `optimize` | Run bounded chronological parameter research | No |
+| `signals-research` | Compare forward returns after signals with controls | No |
 
 Every command supports `--exchange {binance,bybit}`, `--symbol`, `--interval`,
 `--start`, `--end`, and `--database`. Binance remains the default exchange.
@@ -252,6 +254,47 @@ JSON reports to preserve exact representation. Optimization output is research
 evidence, not a profitability claim; small trade counts and unstable
 train/validation behavior are reported as warnings.
 
+## Signal event study
+
+`signals-research` evaluates existing BUY and SELL decisions without position
+sizing, FIFO accounting, or portfolio execution. A signal formed on a candle
+close enters at the next candle open. The 1h, 6h, 12h, 24h, 48h, and 72h
+outcomes use the close at the end of that complete forward window. Events whose
+entry or future window would cross a chronological-period boundary are
+excluded.
+
+For BUY, a positive directional return is an upward move. For SELL, the
+directional return is the negative ordinary market return: it measures whether
+price subsequently declined, but does not represent a short position or an
+executable Spot PnL. Future highs and lows are used only after signal creation
+to calculate MAE and MFE.
+
+Each signal group is compared with distinct random entry moments from the same
+chronological period and predeclared trend/ATR regime. Sampling uses a fixed
+seed. Confidence intervals operate on temporal clusters of overlapping forward
+windows, so consecutive hourly events are not counted as independent. Small
+effective samples produce `inconclusive`, not a profitability claim.
+
+```bash
+cryptolab signals-research \
+  --exchange bybit \
+  --symbol BTCUSDT \
+  --interval 1h \
+  --start 2023-11-01 \
+  --end 2026-11-01 \
+  --database data/market_data.db \
+  --strategy all \
+  --random-seed 20261114 \
+  --output-json reports/signal-study.json \
+  --output-csv reports/signal-study.csv
+```
+
+The report uses fixed one-dimensional RSI, ATR, relative-volume,
+price-versus-SMA50, trend, and trend-strength buckets. These are descriptive
+breakdowns, not automatically generated strategy filters. A previously used
+optimization Test period is labeled `studied_test`; genuinely independent
+confirmation requires future data not used by either workflow.
+
 ## Backtesting assumptions
 
 Each selected strategy receives an independent virtual portfolio starting with
@@ -384,5 +427,6 @@ headers.
 
 See [architecture](docs/architecture.md),
 [strategy optimization](docs/strategy-optimization.md),
+[signal event study](docs/signal-event-study.md),
 [ADR 0001](docs/decisions/0001-initial-architecture.md), and
 [ADR 0002](docs/decisions/0002-data-integrity-and-release.md).

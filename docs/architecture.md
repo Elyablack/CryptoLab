@@ -27,12 +27,18 @@ CLI
 │                        ├── three independent BacktestEngine runs
 │                        ├── buy-and-hold and cash-only
 │                        └── signal/trade diagnostics
-└── optimize ─ quality ── StrategyOptimizationRunner
-                         ├── bounded ParameterGrid
-                         ├── chronological train/validation/test gates
-                         ├── independent BacktestEngine evaluations
-                         ├── period benchmarks and optional walk-forward
-                         └── text plus JSON/CSV reports
+├── optimize ─ quality ── StrategyOptimizationRunner
+│                        ├── bounded ParameterGrid
+│                        ├── chronological train/validation/test gates
+│                        ├── independent BacktestEngine evaluations
+│                        ├── period benchmarks and optional walk-forward
+│                        └── text plus JSON/CSV reports
+└── signals-research ─ quality ── SignalEventStudyRunner
+                                 ├── existing StrategyRunner decisions
+                                 ├── next-open forward-return events
+                                 ├── deterministic regime-matched controls
+                                 ├── overlap-cluster uncertainty
+                                 └── text plus JSON/CSV reports
 ```
 
 ### Market data
@@ -120,6 +126,21 @@ unbounded work. Decimal parameters and metrics retain exact string
 representations in the JSON output; CSV contains one train/validation row per
 configuration. Generated optimization reports remain ignored runtime
 artifacts.
+
+`SignalEventStudyRunner` evaluates the existing decisions independently of
+cash and position state. It maps a signal available after close to the next
+candle open, calculates complete-window forward returns and MAE/MFE, and
+rejects windows that cross chronological split boundaries. SELL direction is
+represented as the negative ordinary market return for research only; it does
+not create a short position.
+
+Matched control entries come from the same period and predeclared trend/ATR
+regime, exclude the strategy's actionable entries, and are sampled without
+replacement with a fixed seed. Overlapping signal windows are combined into
+temporal clusters before bootstrap uncertainty is calculated. RSI, ATR, RVOL,
+price/SMA, trend, and trend-strength regime tables use only the signal row's
+already available features. The previously optimized test period is labeled
+`studied_test`, not treated as a fresh independent holdout.
 
 ## Collection state machine
 
@@ -224,6 +245,8 @@ state if any migration step fails.
 - Trailing high updates only after the current candle stop check.
 - Optimization ranking never reads holdout metrics; feature rows after a
   period's `end_time` are removed by the existing `as_of_time` boundary.
+- Event-study outcomes never cross a chronological boundary, and future
+  high/low values are used only for post-signal MAE/MFE diagnostics.
 
 ## Operational model
 
@@ -255,7 +278,8 @@ current implementation authenticates or communicates with a trading endpoint.
 - no historical conflict auto-resolution;
 - no multi-writer SQLite coordination;
 - no scheduler or monitoring service;
-- machine-readable output is limited to optimization JSON/CSV reports;
+- machine-readable research output is available for optimization and signal
+  event-study reports;
 - no authenticated paper/testnet/live venue adapter or durable order store;
 - multi-symbol backtests require aligned timelines, one strategy, and a
   common exchange/interval/USDT balance;
