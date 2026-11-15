@@ -1,96 +1,74 @@
-# ADR 0001: Начальная архитектура CryptoLab
+# ADR 0001: Initial CryptoLab Architecture
 
-- Статус: принято
-- Дата: 2026-11-03
+- Status: Accepted
+- Date: 2026-11-03
 
-## Контекст
+## Context
 
-CryptoLab создаётся как исследовательская платформа для изучения и анализа
-криптовалютного рынка. Первый этап — надёжный сбор исторических часовых OHLCV-
-данных для `BTC/USDT` и `ETH/USDT`.
+CryptoLab is being built as a research platform for studying and analyzing the cryptocurrency market. The first milestone is to reliably collect historical hourly OHLCV data for `BTC/USDT` and `ETH/USDT`.
 
-Система должна быть понятной, легко проверяемой и пригодной для постепенного
-обучения Python. На этом этапе нет требований к высокой доступности,
-горизонтальному масштабированию, потоковой обработке или торговым операциям.
+The system should be easy to understand and verify, and suitable for learning Python step by step. At this stage, there are no requirements for high availability, horizontal scaling, stream processing, or trading operations.
 
-## Решение
+## Decision
 
-### Одно Python-приложение
+### A Single Python Application
 
-Collector будет реализован как одно Python-приложение с CLI. Внутри приложения
-обязанности разделяются на HTTP-клиент, оркестратор сбора, валидацию и слой
-хранения, но они не разворачиваются как отдельные сервисы.
+The collector will be implemented as a single Python application with a CLI. Within the application, responsibilities are divided among the HTTP client, collection orchestrator, validation, and storage layers. These components are deployed together.
 
 ### Binance Spot Public API
 
-Источником первой версии выбран публичный API Binance Spot. Для свечей будет
-использоваться публичный market-data endpoint `GET /api/v3/klines`. API-ключи,
-приватные методы и методы размещения заявок не используются.
+The Binance Spot public API is the data source for the first version. The collector will retrieve candles using the public market data endpoint `GET /api/v3/klines`. It will operate without API keys, private endpoints, or order placement endpoints.
 
-### SQLite для хранения данных
+### SQLite for Data Storage
 
-Исторические свечи и сведения о запусках сохраняются в локальной SQLite-базе.
-Составной первичный ключ свечи обеспечивает уникальность, а UPSERT делает
-повторный сбор идемпотентным.
+Historical candles and collection run metadata are stored in a local SQLite database. A composite primary key ensures candle uniqueness, and UPSERT makes repeated collection idempotent.
 
-### HTTPX для HTTP-запросов
+### HTTPX for HTTP Requests
 
-Для работы с публичным API используется `httpx`. Он предоставляет явные
-таймауты, доступ к HTTP-заголовкам и удобный механизм подмены транспорта в
-автоматических тестах.
+The application uses `httpx` to access the public API. It provides explicit timeouts, access to HTTP headers, and a convenient way to substitute the transport in automated tests.
 
-### Decimal для финансовых значений
+### Decimal for Financial Values
 
-Цены и объёмы разбираются через `Decimal`, а не `float`. Это позволяет не
-вносить ошибки двоичного представления чисел на этапе получения, проверки и
-сохранения исходных данных.
+Prices and volumes are parsed with `Decimal` to avoid binary floating-point representation errors when receiving, validating, and storing source data.
 
-### Pytest для тестирования
+### Pytest for Testing
 
-Для модульных и интеграционных тестов используется `pytest`. Основные сценарии
-HTTP-взаимодействия тестируются без доступа к реальной бирже на заранее
-подготовленных ответах.
+The project uses `pytest` for unit and integration tests. Core HTTP scenarios run against predefined responses without connecting to the exchange.
 
-### Без микросервисов, Kubernetes и автоматической торговли
+### No Microservices, Kubernetes, or Automated Trading
 
-Первая версия не включает:
+The following are out of scope for the first version.
 
-- микросервисную архитектуру;
-- Kubernetes;
-- Redis и брокеры сообщений;
-- автоматическую торговлю;
-- приватные API-ключи;
-- размещение, изменение или отмену торговых заявок.
+- Microservice architecture
+- Kubernetes
+- Redis and message brokers
+- Automated trading
+- Private API keys
+- Placing, modifying, or canceling trading orders
 
-## Последствия
+## Consequences
 
-Положительные последствия:
+### Benefits
 
-- систему можно запускать и исследовать локально;
-- мало инфраструктурных компонентов и точек отказа;
-- поведение повторного сбора легко воспроизвести;
-- компоненты можно тестировать независимо внутри одного приложения;
-- архитектура соответствует текущему небольшому объёму данных.
+- The system can be run and explored locally.
+- There are few infrastructure components and points of failure.
+- Repeated collection is easy to reproduce.
+- Components can be tested independently within the same application.
+- The architecture fits the current small data volume.
 
-Ограничения:
+### Limitations
 
-- SQLite не рассчитана на множество одновременно записывающих процессов;
-- реализация первоначально связана с форматом Binance;
-- приложение не обеспечивает распределённую высокую доступность;
-- масштабирование и поддержка других бирж потребуют новых решений.
+- SQLite is designed for a single writer at a time.
+- The initial implementation is tied to Binance’s data format.
+- The application does not provide distributed high availability.
+- Scaling and support for other exchanges will require further architectural decisions.
 
-Эти ограничения приемлемы для исследовательской первой версии. Переход к более
-сложной архитектуре должен основываться на измеримых проблемах, а не на
-предполагаемой будущей нагрузке.
+These limitations are acceptable for the first research release. Moving to a more complex architecture should be driven by measured problems with the current design.
 
-## Рассмотренные альтернативы
+## Alternatives Considered
 
-- PostgreSQL отклонён как преждевременное инфраструктурное усложнение.
-- `requests` допустим, но `httpx` выбран из-за удобных таймаутов и тестового
-  транспорта.
-- `float` отклонён для этапа сбора из-за потери десятичной точности.
-- `ccxt` отложен: для одной биржи прямой клиент делает правила пагинации и
-  обработки ошибок прозрачнее.
-- Микросервисы и очередь сообщений отклонены, потому что текущая задача не
-  требует независимого масштабирования компонентов.
-
+- PostgreSQL was rejected because it would add infrastructure complexity at this stage.
+- `requests` was a viable option. `httpx` was chosen for its timeout controls and test transport.
+- `float` was rejected for data collection because it can lose decimal precision.
+- `ccxt` was deferred. With a single exchange, a direct client makes pagination and error-handling rules easier to follow.
+- Microservices and a message queue were rejected because the current use case has no need to scale components independently.
