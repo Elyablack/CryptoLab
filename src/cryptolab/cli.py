@@ -42,13 +42,23 @@ from cryptolab.market_data.markets import (
 from cryptolab.market_data.parser import parse_bybit_klines
 from cryptolab.paper import (
     ContinuousPaperTrader,
+    MetricsServer,
     MultiSymbolPaperBotConfig,
     MultiSymbolPaperTrader,
+    NotificationOutbox,
     PaperBotConfig,
     PaperExecutionConfig,
+    PaperMetrics,
     PaperRiskConfig,
+    PaperTelemetry,
+    TelegramNotifier,
+    backup_sqlite,
+    configure_json_logging,
+    paper_health,
+    restore_sqlite,
     set_paper_trading_pause,
     set_portfolio_paper_trading_pause,
+    verify_sqlite_database,
 )
 from cryptolab.research import StrategyResearchRunner
 from cryptolab.research.event_study import SignalEventStudyRunner
@@ -69,6 +79,7 @@ from cryptolab.research.parameter_grid import (
     grid_from_mapping,
 )
 from cryptolab.storage.sqlite_repository import SQLiteRepository
+from cryptolab.storage.paper_state_repository import PaperStateRepository
 from cryptolab.strategies import (
     BreakoutStrategy,
     MeanReversionStrategy,
@@ -88,7 +99,10 @@ def main(argv: list[str] | None = None) -> int:
     """Run the CryptoLab command-line interface."""
     parser = _create_parser()
     args = parser.parse_args(argv)
-    _configure_logging(args.verbose)
+    _configure_logging(
+        args.verbose,
+        json_logs=bool(getattr(args, "json_logs", False)),
+    )
 
     if args.command == "paper":
         return _run_paper(args)
@@ -141,7 +155,43 @@ def main(argv: list[str] | None = None) -> int:
 
 def _run_paper(args: argparse.Namespace) -> int:
     """Run or inspect public-data-only single or portfolio paper trading."""
+    telemetry: PaperTelemetry | None = None
+    metrics_server: MetricsServer | None = None
+    outbox: NotificationOutbox | None = None
     try:
+        if args.paper_command == "health":
+            report = paper_health(
+                args.state_database,
+                session_id=args.session_id,
+                mode=args.mode,
+            )
+            print(
+                "Paper health: "
+                f"healthy={str(report.healthy).lower()}, "
+                f"session={report.session_id}, mode={report.mode}, "
+                f"schema={report.schema_version}, "
+                f"checkpoint={report.checkpoint_sequence}, "
+                f"last_candle={report.last_candle_open_time}, "
+                f"reconciled={str(report.reconciled).lower()}"
+            )
+            print(report.message)
+            return 0 if report.healthy else 1
+        if args.paper_command == "backup":
+            report = backup_sqlite(args.source_database, args.output)
+            _print_database_verification("Backup created", report)
+            return 0
+        if args.paper_command == "verify-backup":
+            report = verify_sqlite_database(args.backup)
+            _print_database_verification("Backup verified", report)
+            return 0
+        if args.paper_command == "restore":
+            report = restore_sqlite(args.backup, args.output)
+            _print_database_verification("Backup restored", report)
+            print(
+                "Restore used a new path. Run paper health and paper "
+                "integrity against it before changing deployment paths."
+            )
+            return 0
         if args.paper_command in ("pause", "resume"):
             paused = args.paper_command == "pause"
             pause = (
@@ -158,10 +208,14 @@ def _run_paper(args: argparse.Namespace) -> int:
                 f"Paper trading {'paused' if paused else 'resumed'}: "
                 f"session={args.session_id}, revision={revision}"
             )
+            _notify_manual_control(args, paused, revision)
             return 0
 
+        if args.paper_command in ("run", "run-once"):
+            telemetry, metrics_server, outbox = _create_paper_telemetry(args)
+
         if args.mode == "multi":
-            return _run_multi_symbol_paper(args)
+            return _run_multi_symbol_paper(args, telemetry=telemetry)
 
         strategies = _create_strategies(args.strategy)
         if len(strategies) != 1:
@@ -209,6 +263,7 @@ def _run_paper(args: argparse.Namespace) -> int:
                 ),
             ),
             position_sizer=position_sizer,
+            telemetry=telemetry,
         )
         if args.paper_command == "run-once":
             result = trader.run_once()
@@ -248,9 +303,18 @@ def _run_paper(args: argparse.Namespace) -> int:
         print(f"Paper command failed: {error}", file=sys.stderr)
         LOGGER.debug("Paper command failure details", exc_info=True)
         return 1
+    finally:
+        if metrics_server is not None:
+            metrics_server.stop()
+        if outbox is not None:
+            outbox.close()
 
 
-def _run_multi_symbol_paper(args: argparse.Namespace) -> int:
+def _run_multi_symbol_paper(
+    args: argparse.Namespace,
+    *,
+    telemetry: PaperTelemetry | None = None,
+) -> int:
     """Dispatch the fixed BTC/ETH Rotation shared-USDT paper service."""
     if args.strategy != "rotation":
         raise ValueError(
@@ -295,6 +359,7 @@ def _run_multi_symbol_paper(args: argparse.Namespace) -> int:
             cancel_unfilled_remainder=not args.keep_partial_order_open,
         ),
         position_sizer=position_sizer,
+        telemetry=telemetry,
     )
     if args.paper_command == "run-once":
         result = trader.run_once()
@@ -402,6 +467,82 @@ def _print_portfolio_paper_status(status) -> None:
     )
     for diagnostic in status.reconciliation_diagnostics:
         print(f"reconciliation: {diagnostic}")
+
+
+def _create_paper_telemetry(
+    args: argparse.Namespace,
+) -> tuple[PaperTelemetry, MetricsServer | None, NotificationOutbox]:
+    repository = PaperStateRepository(args.state_database)
+    repository.init_schema()
+    notifier = TelegramNotifier.from_environment()
+    if args.telegram and notifier is None:
+        raise ValueError(
+            "--telegram requires CRYPTOLAB_TELEGRAM_BOT_TOKEN and "
+            "CRYPTOLAB_TELEGRAM_CHAT_ID"
+        )
+    outbox = NotificationOutbox(repository, notifier)
+    metrics = PaperMetrics()
+    telemetry = PaperTelemetry(
+        session_id=args.session_id,
+        mode=args.mode,
+        metrics=metrics,
+        outbox=outbox,
+    )
+    server: MetricsServer | None = None
+    if args.metrics_port is not None:
+        candidate = MetricsServer(
+            metrics,
+            host=args.metrics_host,
+            port=args.metrics_port,
+        )
+        if candidate.start():
+            server = candidate
+    return telemetry, server, outbox
+
+
+def _notify_manual_control(
+    args: argparse.Namespace,
+    paused: bool,
+    revision: int,
+) -> None:
+    outbox: NotificationOutbox | None = None
+    try:
+        repository = PaperStateRepository(args.state_database)
+        repository.init_schema()
+        notifier = TelegramNotifier.from_environment()
+        outbox = NotificationOutbox(repository, notifier)
+        telemetry = PaperTelemetry(
+            session_id=args.session_id,
+            mode=args.mode,
+            outbox=outbox,
+        )
+        telemetry.event(
+            "manual_pause" if paused else "manual_resume",
+            (
+                "Paper BUY intents paused"
+                if paused
+                else "Paper BUY intents resumed"
+            ),
+            dedup_key=f"manual-control:{revision}",
+            notify=True,
+        )
+        telemetry.flush()
+    except Exception as error:
+        LOGGER.warning(
+            "Manual control notification failed (%s); control is durable",
+            type(error).__name__,
+        )
+    finally:
+        if outbox is not None:
+            outbox.close()
+
+
+def _print_database_verification(prefix: str, report) -> None:
+    print(
+        f"{prefix}: path={report.path}, type={report.database_type}, "
+        f"schema={report.schema_version}, "
+        f"integrity_ok={str(report.integrity_ok).lower()}"
+    )
 
 
 def _run_collect(
@@ -1370,6 +1511,65 @@ def _create_parser() -> argparse.ArgumentParser:
             action="store_true",
             help="show debug diagnostics on stderr",
         )
+        command_parser.add_argument(
+            "--json-logs",
+            action="store_true",
+            help="emit structured JSON operational logs",
+        )
+        command_parser.add_argument(
+            "--telegram",
+            action="store_true",
+            help="enqueue Telegram notification using environment credentials",
+        )
+
+    health_parser = paper_subparsers.add_parser(
+        "health",
+        help="perform a network-free paper checkpoint health check",
+    )
+    health_parser.add_argument("--session-id", required=True)
+    health_parser.add_argument(
+        "--mode", choices=("single", "multi"), default="single"
+    )
+    health_parser.add_argument(
+        "--state-database",
+        type=Path,
+        default=Path("data/paper_state.db"),
+        metavar="PATH",
+    )
+    _add_operational_logging_arguments(health_parser)
+
+    backup_parser = paper_subparsers.add_parser(
+        "backup",
+        help="create a consistent online SQLite backup",
+    )
+    backup_parser.add_argument(
+        "--source-database", type=Path, required=True, metavar="PATH"
+    )
+    backup_parser.add_argument(
+        "--output", type=Path, required=True, metavar="PATH"
+    )
+    _add_operational_logging_arguments(backup_parser)
+
+    verify_parser = paper_subparsers.add_parser(
+        "verify-backup",
+        help="verify SQLite integrity and CryptoLab schema compatibility",
+    )
+    verify_parser.add_argument(
+        "--backup", type=Path, required=True, metavar="PATH"
+    )
+    _add_operational_logging_arguments(verify_parser)
+
+    restore_parser = paper_subparsers.add_parser(
+        "restore",
+        help="restore a verified backup to a new path",
+    )
+    restore_parser.add_argument(
+        "--backup", type=Path, required=True, metavar="PATH"
+    )
+    restore_parser.add_argument(
+        "--output", type=Path, required=True, metavar="NEW_PATH"
+    )
+    _add_operational_logging_arguments(restore_parser)
 
     return parser
 
@@ -1513,6 +1713,43 @@ def _add_paper_runtime_arguments(
         "--verbose",
         action="store_true",
         help="show debug diagnostics on stderr",
+    )
+    command_parser.add_argument(
+        "--json-logs",
+        action="store_true",
+        help="emit one structured JSON object per operational event",
+    )
+    command_parser.add_argument(
+        "--metrics-host",
+        default="127.0.0.1",
+        help="metrics bind host (default: loopback)",
+    )
+    command_parser.add_argument(
+        "--metrics-port",
+        type=_parse_positive_integer,
+        default=None,
+        metavar="PORT",
+        help="enable the Prometheus endpoint on this port",
+    )
+    command_parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="deliver durable notifications using environment credentials",
+    )
+
+
+def _add_operational_logging_arguments(
+    parser: argparse.ArgumentParser,
+) -> None:
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="show debug diagnostics on stderr",
+    )
+    parser.add_argument(
+        "--json-logs",
+        action="store_true",
+        help="emit structured JSON operational logs",
     )
 
 
@@ -1871,8 +2108,13 @@ def _market_identity_kwargs(exchange: str) -> dict[str, str]:
     }
 
 
-def _configure_logging(verbose: bool) -> None:
+def _configure_logging(verbose: bool, *, json_logs: bool = False) -> None:
     """Configure dependency-free operational logging for one CLI run."""
+    if json_logs:
+        configure_json_logging(
+            logging.DEBUG if verbose else logging.INFO
+        )
+        return
     level = logging.DEBUG if verbose else logging.WARNING
     root_logger = logging.getLogger()
     if not root_logger.handlers:

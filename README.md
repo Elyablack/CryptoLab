@@ -91,7 +91,7 @@ All date ranges use UTC and half-open semantics: `[start, end)`.
 Historical-data and research commands support `--exchange
 {binance,bybit}`, `--symbol`, `--interval`, `--start`, `--end`, and
 `--database`. Binance remains their default exchange. The `paper` command has
-its own explicit market/state paths and Stage 3 controls. Place `--verbose`
+its own explicit market/state paths and operational controls. Place `--verbose`
 after the selected subcommand to include debug diagnostics on stderr.
 
 Supported intervals are `1m`, `5m`, `15m`, `1h`, `4h`, and `1d`.
@@ -117,6 +117,32 @@ defaults to `data/paper_state.db`. Use identical strategy, sizing, execution,
 fee/slippage, and risk arguments when recovering a session. See
 `docs/paper-bot-stage-3.md` for the exact time model, limits, migration,
 failure behavior, and simulation limitations.
+
+Stage 4 adds an explicit shared-USDT BTC/ETH Rotation mode, while preserving
+the single-symbol default:
+
+```bash
+cryptolab paper run \
+  --mode multi --session-id btc-eth-rotation --strategy rotation
+```
+
+Stage 5 adds structured logs, optional loopback Prometheus metrics, durable
+Telegram notifications, health checks, and safe SQLite backup/restore:
+
+```bash
+cryptolab paper run ... --json-logs --metrics-port 9108
+cryptolab paper health --mode multi --session-id btc-eth-rotation
+cryptolab paper backup --source-database data/paper_state.db \
+  --output backups/paper_state.db
+cryptolab paper verify-backup --backup backups/paper_state.db
+cryptolab paper restore --backup backups/paper_state.db \
+  --output data/restore-check/paper_state.db
+```
+
+Telegram uses `CRYPTOLAB_TELEGRAM_BOT_TOKEN` and
+`CRYPTOLAB_TELEGRAM_CHAT_ID`; no credential is stored in project files or
+SQLite. See [Stage 5 architecture](docs/paper-bot-stage-5.md) and the
+[operations runbook](docs/paper-bot-operations.md).
 
 ## Reliable collection behavior
 

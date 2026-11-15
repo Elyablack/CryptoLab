@@ -1,0 +1,64 @@
+services:
+  paper-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cryptolab-paper:1.0.0
+    init: true
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    command:
+      - paper
+      - run
+      - --mode
+      - multi
+      - --session-id
+      - btc-eth-rotation
+      - --strategy
+      - rotation
+      - --market-database
+      - /app/data/market_data.db
+      - --state-database
+      - /app/data/paper_state.db
+      - --json-logs
+      - --metrics-host
+      - 0.0.0.0
+      - --metrics-port
+      - "9108"
+    environment:
+      CRYPTOLAB_TELEGRAM_BOT_TOKEN: ${CRYPTOLAB_TELEGRAM_BOT_TOKEN:-}
+      CRYPTOLAB_TELEGRAM_CHAT_ID: ${CRYPTOLAB_TELEGRAM_CHAT_ID:-}
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+    ports:
+      - "127.0.0.1:9108:9108"
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    healthcheck:
+      test:
+        - CMD
+        - cryptolab
+        - paper
+        - health
+        - --mode
+        - multi
+        - --session-id
+        - btc-eth-rotation
+        - --state-database
+        - /app/data/paper_state.db
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+

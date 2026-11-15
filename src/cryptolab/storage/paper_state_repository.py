@@ -24,7 +24,7 @@ from cryptolab.replay.serialization import (
 )
 
 
-PAPER_STATE_SCHEMA_VERSION = 3
+PAPER_STATE_SCHEMA_VERSION = 4
 PAPER_STATE_SERIALIZATION_VERSION = 1
 
 
@@ -186,6 +186,21 @@ CREATE TABLE paper_portfolio_reconciliations (
     PRIMARY KEY (session_id, revision),
     FOREIGN KEY (session_id) REFERENCES paper_portfolio_sessions(session_id)
 );
+
+CREATE TABLE paper_notification_outbox (
+    notification_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    dedup_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'sent')),
+    attempts INTEGER NOT NULL,
+    next_attempt_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    sent_at INTEGER,
+    last_error TEXT,
+    UNIQUE (session_id, event_type, dedup_key)
+);
 """
 
 
@@ -204,6 +219,18 @@ class StoredPortfolioPaperSession:
     reconciled: bool
     diagnostics_json: str
     candles: tuple[tuple[int, str, int, str], ...]
+
+
+@dataclass(frozen=True)
+class StoredNotification:
+    notification_id: str
+    session_id: str
+    event_type: str
+    dedup_key: str
+    payload_json: str
+    attempts: int
+    next_attempt_at: int
+    created_at: int
 
 
 class PaperStateRepository:
@@ -240,6 +267,9 @@ class PaperStateRepository:
             if version == 2:
                 self._migrate_v2_to_v3(connection)
                 version = 3
+            if version == 3:
+                self._migrate_v3_to_v4(connection)
+                version = 4
             if version != PAPER_STATE_SCHEMA_VERSION:
                 raise ReplayStateIntegrityError(
                     f"Unsupported paper-state schema version {version}; "
@@ -263,6 +293,7 @@ class PaperStateRepository:
                 "paper_portfolio_checkpoints",
                 "paper_portfolio_controls",
                 "paper_portfolio_reconciliations",
+                "paper_notification_outbox",
             }
             actual = {
                 row[0]
@@ -954,6 +985,155 @@ class PaperStateRepository:
             )
         return bool(row[0])
 
+    def enqueue_notification(
+        self,
+        *,
+        notification_id: str,
+        session_id: str,
+        event_type: str,
+        dedup_key: str,
+        payload_json: str,
+        created_at: int,
+    ) -> bool:
+        """Persist one deduplicated notification; return False if it exists."""
+        for name, value in (
+            ("notification_id", notification_id),
+            ("session_id", session_id),
+            ("event_type", event_type),
+            ("dedup_key", dedup_key),
+            ("payload_json", payload_json),
+        ):
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be non-empty")
+        if type(created_at) is not int or created_at < 0:
+            raise ValueError("created_at must be a non-negative integer")
+        with self._connect() as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO paper_notification_outbox (
+                        notification_id, session_id, event_type, dedup_key,
+                        payload_json, status, attempts, next_attempt_at,
+                        created_at, sent_at, last_error
+                    ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, NULL, NULL)
+                    """,
+                    (
+                        notification_id,
+                        session_id,
+                        event_type,
+                        dedup_key,
+                        payload_json,
+                        created_at,
+                        created_at,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                row = connection.execute(
+                    """
+                    SELECT notification_id, payload_json
+                    FROM paper_notification_outbox
+                    WHERE session_id = ? AND event_type = ? AND dedup_key = ?
+                    """,
+                    (session_id, event_type, dedup_key),
+                ).fetchone()
+                if row is None or row != (notification_id, payload_json):
+                    raise ReplayStateIntegrityError(
+                        "Conflicting notification deduplication key"
+                    )
+                return False
+        return True
+
+    def pending_notifications(
+        self,
+        *,
+        now_ms: int,
+        limit: int,
+    ) -> tuple[StoredNotification, ...]:
+        if type(now_ms) is not int or now_ms < 0:
+            raise ValueError("now_ms must be a non-negative integer")
+        if type(limit) is not int or limit <= 0:
+            raise ValueError("limit must be positive")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT notification_id, session_id, event_type, dedup_key,
+                       payload_json, attempts, next_attempt_at, created_at
+                FROM paper_notification_outbox
+                WHERE status = 'pending' AND next_attempt_at <= ?
+                ORDER BY created_at, notification_id
+                LIMIT ?
+                """,
+                (now_ms, limit),
+            ).fetchall()
+        return tuple(StoredNotification(*row) for row in rows)
+
+    def mark_notification_sent(
+        self,
+        notification_id: str,
+        *,
+        sent_at: int,
+    ) -> None:
+        if type(sent_at) is not int or sent_at < 0:
+            raise ValueError("sent_at must be a non-negative integer")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE paper_notification_outbox
+                SET status = 'sent', sent_at = ?, last_error = NULL
+                WHERE notification_id = ? AND status = 'pending'
+                """,
+                (sent_at, notification_id),
+            )
+        if cursor.rowcount not in (0, 1):
+            raise ReplayStateIntegrityError(
+                "Notification sent transition affected unexpected rows"
+            )
+
+    def defer_notification(
+        self,
+        notification_id: str,
+        *,
+        next_attempt_at: int,
+        error: str,
+    ) -> None:
+        if type(next_attempt_at) is not int or next_attempt_at < 0:
+            raise ValueError("next_attempt_at must be non-negative")
+        if not isinstance(error, str) or not error.strip():
+            raise ValueError("notification error must be non-empty")
+        sanitized = error[:500]
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE paper_notification_outbox
+                SET attempts = attempts + 1, next_attempt_at = ?,
+                    last_error = ?
+                WHERE notification_id = ? AND status = 'pending'
+                """,
+                (next_attempt_at, sanitized, notification_id),
+            )
+        if cursor.rowcount != 1:
+            raise ReplayStateIntegrityError(
+                "Unknown or already-sent notification"
+            )
+
+    def latest_notification_sent_at(self) -> int | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT MAX(sent_at) FROM paper_notification_outbox "
+                "WHERE status = 'sent'"
+            ).fetchone()
+        return None if row is None else row[0]
+
+    def notification_counts(self) -> tuple[int, int]:
+        with self._connect() as connection:
+            rows = dict(connection.execute(
+                """
+                SELECT status, COUNT(*) FROM paper_notification_outbox
+                GROUP BY status
+                """
+            ).fetchall())
+        return int(rows.get("pending", 0)), int(rows.get("sent", 0))
+
     def _write_state(
         self,
         connection: sqlite3.Connection,
@@ -1414,6 +1594,42 @@ class PaperStateRepository:
                 "UPDATE paper_sessions SET schema_version = 3"
             )
             connection.execute("PRAGMA user_version = 3")
+            connection.execute("COMMIT")
+        except Exception:
+            connection.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v3_to_v4(connection: sqlite3.Connection) -> None:
+        """Add a durable notification outbox without changing trade state."""
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS paper_notification_outbox (
+                    notification_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    dedup_key TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN ('pending', 'sent')),
+                    attempts INTEGER NOT NULL,
+                    next_attempt_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    sent_at INTEGER,
+                    last_error TEXT,
+                    UNIQUE (session_id, event_type, dedup_key)
+                )
+                """
+            )
+            connection.execute(
+                "UPDATE paper_sessions SET schema_version = 4"
+            )
+            connection.execute(
+                "UPDATE paper_portfolio_sessions SET schema_version = 4"
+            )
+            connection.execute("PRAGMA user_version = 4")
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")

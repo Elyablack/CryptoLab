@@ -1,0 +1,8 @@
+# Merge this job into the existing Prometheus configuration when desired.
+# The target name is reachable only from the Docker network by default.
+scrape_configs:
+  - job_name: cryptolab-paper
+    scrape_interval: 30s
+    static_configs:
+      - targets:
+          - paper-bot:9108

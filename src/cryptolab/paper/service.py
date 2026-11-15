@@ -21,6 +21,7 @@ from cryptolab.paper.models import (
     PaperRiskConfig,
     PaperSessionStatus,
 )
+from cryptolab.paper.observability import PaperTelemetry
 from cryptolab.paper.risk import PaperRiskManager
 from cryptolab.replay.models import PriceObservation, ReplayExecutionMode
 from cryptolab.replay.persistence_models import ReplayStateIntegrityError
@@ -50,6 +51,7 @@ class ContinuousPaperTrader:
         market_source: PaperMarketSource | None = None,
         now_ms: Callable[[], int] | None = None,
         sleep: Callable[[float], None] | None = None,
+        telemetry: PaperTelemetry | None = None,
     ) -> None:
         self.config = config
         self.strategy = strategy
@@ -63,6 +65,7 @@ class ContinuousPaperTrader:
         )
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._sleep = sleep or time.sleep
+        self.telemetry = telemetry
         config.market_database.parent.mkdir(parents=True, exist_ok=True)
         config.state_database.parent.mkdir(parents=True, exist_ok=True)
         self.market_source = market_source or BybitPaperMarketSource(
@@ -97,7 +100,8 @@ class ContinuousPaperTrader:
         """Create or deterministically recover the configured paper session."""
         if self._session is not None:
             return self._session
-        if self.repository.session_exists(self.config.session_id):
+        recovered = self.repository.session_exists(self.config.session_id)
+        if recovered:
             session = self._runner.recover(
                 self.config.session_id,
                 self.strategy,
@@ -123,6 +127,16 @@ class ContinuousPaperTrader:
             self.repository.get_trading_paused(self.config.session_id)
         )
         self._session = session
+        if self.telemetry is not None:
+            execution = self.repository.load_execution_snapshot(
+                self.config.session_id
+            )
+            self.telemetry.started(
+                recovered=recovered,
+                orders=execution.lifecycle.orders,
+                fills=execution.lifecycle.fills,
+                checkpoint_sequence=session.current_state.checkpoint_sequence,
+            )
         return session
 
     def run_once(self) -> PaperCycleResult:
@@ -143,7 +157,7 @@ class ContinuousPaperTrader:
         else:
             range_start = state.checkpoint_open_time + interval_ms
         if range_start >= closed_range_end:
-            return PaperCycleResult(
+            result = PaperCycleResult(
                 session_id=self.config.session_id,
                 checked_at=checked_at,
                 range_start=None,
@@ -155,6 +169,8 @@ class ContinuousPaperTrader:
                 trading_paused=self.risk_manager.paused,
                 message="no newly closed candle is available",
             )
+            self._observe_telemetry(session, result)
+            return result
 
         candles = self.market_source.load_closed_candles(
             self.config.symbol,
@@ -218,7 +234,7 @@ class ContinuousPaperTrader:
             else:
                 backfilled += 1
         current = session.current_state
-        return PaperCycleResult(
+        result = PaperCycleResult(
             session_id=self.config.session_id,
             checked_at=checked_at,
             range_start=range_start,
@@ -230,6 +246,8 @@ class ContinuousPaperTrader:
             trading_paused=self.risk_manager.paused,
             message="paper cycle completed",
         )
+        self._observe_telemetry(session, result)
+        return result
 
     def run_forever(self, stop_event: Event | None = None) -> None:
         """Poll until graceful stop; integrity failures remain fail-closed."""
@@ -247,11 +265,29 @@ class ContinuousPaperTrader:
                         result.fills_created,
                     )
                 except ReplayStateIntegrityError:
+                    if self.telemetry is not None:
+                        self.telemetry.event(
+                            "fail_closed",
+                            "Paper state integrity failed; stopping fail-closed",
+                            dedup_key=(
+                                f"fail-closed:"
+                                f"{self.config.session_id}:"
+                                f"{self._now_ms()}"
+                            ),
+                            notify=True,
+                            level=logging.ERROR,
+                        )
                     LOGGER.exception(
                         "Paper state integrity failed; stopping fail-closed"
                     )
                     raise
                 except Exception:
+                    if self.telemetry is not None:
+                        self.telemetry.event(
+                            "paper_cycle_error",
+                            "Paper cycle failed at the durable checkpoint",
+                            level=logging.ERROR,
+                        )
                     LOGGER.exception(
                         "Paper cycle failed; state remains at last checkpoint"
                     )
@@ -262,6 +298,10 @@ class ContinuousPaperTrader:
                 if not stop.is_set():
                     self._sleep(self.config.poll_seconds)
         finally:
+            if self.telemetry is not None and self._session is not None:
+                self.telemetry.stopped(
+                    self._session.current_state.checkpoint_sequence
+                )
             self.close()
 
     def status(self) -> PaperSessionStatus:
@@ -290,6 +330,56 @@ class ContinuousPaperTrader:
         if self._session is not None:
             self._session.close()
             self._session = None
+
+    def _observe_telemetry(
+        self,
+        session: PersistentReplaySession,
+        result: PaperCycleResult,
+    ) -> None:
+        if self.telemetry is None:
+            return
+        checkpoint = session.operational_checkpoint
+        execution = checkpoint.execution
+        correlation_id = (
+            f"paper-cycle:{self.config.session_id}:{result.checked_at}"
+        )
+        self.telemetry.execution(
+            execution.orders,
+            execution.execution_fills,
+            correlation_id=correlation_id,
+        )
+        equity = (
+            checkpoint.snapshots[-1].equity
+            if checkpoint.snapshots
+            else self.backtest_config.initial_cash
+        )
+        risk_state = self.risk_manager.snapshot_state()
+        self.telemetry.portfolio(
+            cash=execution.state.quote_balance,
+            equity=equity,
+            paused=self.risk_manager.paused,
+            last_candle_open_time=(
+                checkpoint.candles[-1].open_time
+                if checkpoint.candles
+                else None
+            ),
+            decision_available_time=(
+                checkpoint.decisions[-1].signal_available_time
+                if checkpoint.decisions
+                else None
+            ),
+            interval_ms=get_interval_milliseconds(self.config.interval),
+            risk_rejections=int(risk_state["rejections"]),
+            reconciled=True,
+            correlation_id=correlation_id,
+            peak_equity=risk_state["peak_equity"],
+        )
+        if result.processed_candles and result.live_candles == 0:
+            self.telemetry.stale(
+                candle_open_time=checkpoint.candles[-1].open_time,
+                correlation_id=correlation_id,
+            )
+        self.telemetry.flush()
 
     def _validate_exact_range(
         self,

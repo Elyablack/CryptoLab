@@ -448,7 +448,7 @@ def test_schema_v2_migration_preserves_legacy_tables(tmp_path: Path) -> None:
     repository = PaperStateRepository(database)
     repository.init_schema()
     with sqlite3.connect(database) as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
         tables = {
             item[0]
             for item in connection.execute(

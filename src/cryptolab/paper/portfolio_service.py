@@ -48,6 +48,7 @@ from cryptolab.paper.models import (
     PortfolioReconciliationReport,
     RotationPhase,
 )
+from cryptolab.paper.observability import PaperTelemetry
 from cryptolab.paper.risk import PaperRiskManager
 from cryptolab.replay.models import PriceObservation
 from cryptolab.replay.persistence_models import ReplayStateIntegrityError
@@ -95,6 +96,7 @@ class MultiSymbolPaperTrader:
         sleep: Callable[[float], None] | None = None,
         after_sell_checkpoint: Callable[[], None] | None = None,
         rotation_planner: RelativeMomentumRotationPlanner | None = None,
+        telemetry: PaperTelemetry | None = None,
     ) -> None:
         self.config = config
         self.backtest_config = backtest_config or BacktestConfig()
@@ -108,6 +110,7 @@ class MultiSymbolPaperTrader:
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
         self._sleep = sleep or time.sleep
         self._after_sell_checkpoint = after_sell_checkpoint
+        self.telemetry = telemetry
         config.market_database.parent.mkdir(parents=True, exist_ok=True)
         config.state_database.parent.mkdir(parents=True, exist_ok=True)
         self.market_source = market_source or BybitPaperMarketSource(
@@ -160,7 +163,10 @@ class MultiSymbolPaperTrader:
         """Create or restore a portfolio session and reconcile immediately."""
         if self._started:
             return
-        if self.repository.portfolio_session_exists(self.config.session_id):
+        recovered = self.repository.portfolio_session_exists(
+            self.config.session_id
+        )
+        if recovered:
             self._reset_runtime_state()
             self._restore()
         elif create_if_missing:
@@ -175,13 +181,27 @@ class MultiSymbolPaperTrader:
             )
         )
         self._started = True
-        self.reconcile(persist=True)
+        report = self.reconcile(persist=True)
+        if self.telemetry is not None:
+            self.telemetry.started(
+                recovered=recovered,
+                orders=self._adapter.orders,
+                fills=self._adapter.fills,
+                checkpoint_sequence=self._sequence,
+            )
+            self._observe_telemetry(report, self._now_ms())
 
     def run_once(self) -> MultiSymbolPaperCycleResult:
         """Run one cycle and discard non-durable mutations after failures."""
         try:
             return self._run_once_impl()
         except Exception:
+            if self.telemetry is not None:
+                self.telemetry.event(
+                    "paper_cycle_error",
+                    "Portfolio paper cycle failed at durable state",
+                    level=logging.ERROR,
+                )
             self._reset_runtime_state()
             self._started = False
             raise
@@ -210,7 +230,7 @@ class MultiSymbolPaperTrader:
         if range_start >= closed_range_end:
             live = self._resume_pending(checked_at)
             report = self.reconcile(persist=True)
-            return self._cycle_result(
+            result = self._cycle_result(
                 checked_at=checked_at,
                 range_start=None,
                 range_end=None,
@@ -225,6 +245,8 @@ class MultiSymbolPaperTrader:
                     else "no newly closed synchronized candle set is available"
                 ),
             )
+            self._observe_telemetry(report, checked_at, result=result)
+            return result
 
         loaded = {
             symbol: self.market_source.load_closed_candles(
@@ -270,7 +292,7 @@ class MultiSymbolPaperTrader:
             else:
                 backfilled += 1
         report = self.reconcile(persist=True)
-        return self._cycle_result(
+        result = self._cycle_result(
             checked_at=checked_at,
             range_start=range_start,
             range_end=closed_range_end,
@@ -281,34 +303,48 @@ class MultiSymbolPaperTrader:
             report=report,
             message="multi-symbol paper cycle completed",
         )
+        self._observe_telemetry(report, checked_at, result=result)
+        return result
 
     def run_forever(self, stop_event: Event | None = None) -> None:
         stop = stop_event or Event()
         self.start()
-        while not stop.is_set():
-            try:
-                result = self.run_once()
-                LOGGER.info(
-                    "Portfolio paper cycle: sets=%s live=%s fills=%s "
-                    "reconciled=%s",
-                    result.processed_candle_sets,
-                    result.live_candle_sets,
-                    result.fills_created,
-                    result.reconciled,
-                )
-            except ReplayStateIntegrityError:
-                LOGGER.exception(
-                    "Portfolio paper integrity failed; stopping fail-closed"
-                )
-                raise
-            except Exception:
-                LOGGER.exception(
-                    "Portfolio paper cycle failed at last durable checkpoint"
-                )
-                self._reset_runtime_state()
-                self._started = False
-            if not stop.is_set():
-                self._sleep(self.config.poll_seconds)
+        try:
+            while not stop.is_set():
+                try:
+                    result = self.run_once()
+                    LOGGER.info(
+                        "Portfolio paper cycle: sets=%s live=%s fills=%s "
+                        "reconciled=%s",
+                        result.processed_candle_sets,
+                        result.live_candle_sets,
+                        result.fills_created,
+                        result.reconciled,
+                    )
+                except ReplayStateIntegrityError:
+                    if self.telemetry is not None:
+                        self.telemetry.event(
+                            "fail_closed",
+                            "Portfolio integrity failed; stopping fail-closed",
+                            dedup_key=f"fail-closed:{self._sequence}",
+                            notify=True,
+                            level=logging.ERROR,
+                        )
+                    LOGGER.exception(
+                        "Portfolio paper integrity failed; stopping fail-closed"
+                    )
+                    raise
+                except Exception:
+                    LOGGER.exception(
+                        "Portfolio paper cycle failed at last durable checkpoint"
+                    )
+                    self._reset_runtime_state()
+                    self._started = False
+                if not stop.is_set():
+                    self._sleep(self.config.poll_seconds)
+        finally:
+            if self.telemetry is not None:
+                self.telemetry.stopped(self._sequence)
 
     def status(self) -> MultiSymbolPaperSessionStatus:
         self.start(create_if_missing=False)
@@ -430,6 +466,22 @@ class MultiSymbolPaperTrader:
 
         review = self._review_for_latest_pair()
         if self._pending is None and review is not None:
+            if self.telemetry is not None:
+                self.telemetry.event(
+                    "strategy_decision",
+                    (
+                        "Relative Momentum review selected "
+                        f"{review.target.value}"
+                    ),
+                    candle_timestamp=review.candle_open_time,
+                    decision_id=(
+                        f"rotation:{review.candle_open_time}:"
+                        f"{review.target.value}"
+                    ),
+                    correlation_id=(
+                        f"paper-cycle:{self.config.session_id}:{received_at}"
+                    ),
+                )
             actual = self._actual_target()
             if review.target.value != actual:
                 self._pending = PendingRotation(
@@ -610,6 +662,19 @@ class MultiSymbolPaperTrader:
                 symbol,
                 risk.reason,
             )
+            if self.telemetry is not None:
+                self.telemetry.event(
+                    "risk_rejection",
+                    f"{signal.value} {symbol} rejected: {risk.reason}",
+                    dedup_key=(
+                        f"risk:{pending.source_candle_open_time}:"
+                        f"{signal.value}:{symbol}:{risk.reason}"
+                    ),
+                    notify=True,
+                    symbol=symbol,
+                    candle_timestamp=pending.source_candle_open_time,
+                    reason=risk.reason,
+                )
             return False
         if signal is Signal.BUY:
             if not isinstance(sizing, BuySizingProposal):
@@ -1213,6 +1278,57 @@ class MultiSymbolPaperTrader:
             reconciled=report.consistent,
             message=message,
         )
+
+    def _observe_telemetry(
+        self,
+        report: PortfolioReconciliationReport,
+        checked_at: int,
+        *,
+        result: MultiSymbolPaperCycleResult | None = None,
+    ) -> None:
+        if self.telemetry is None:
+            return
+        correlation_id = (
+            f"paper-cycle:{self.config.session_id}:{checked_at}"
+        )
+        self.telemetry.execution(
+            self._adapter.orders,
+            self._adapter.fills,
+            correlation_id=correlation_id,
+        )
+        risk_state = self.risk_manager.snapshot_state()
+        interval_ms = get_interval_milliseconds(self.config.interval)
+        last_open = (
+            None if self._sequence == 0 else self._last_open_time()
+        )
+        self.telemetry.portfolio(
+            cash=report.quote_balance,
+            equity=(
+                self.backtest_config.initial_cash
+                + report.realized_pnl
+                + report.unrealized_pnl
+            ),
+            paused=self.risk_manager.paused,
+            last_candle_open_time=last_open,
+            decision_available_time=(
+                None if last_open is None else last_open + interval_ms
+            ),
+            interval_ms=interval_ms,
+            risk_rejections=int(risk_state["rejections"]),
+            reconciled=report.consistent,
+            correlation_id=correlation_id,
+            peak_equity=risk_state["peak_equity"],
+        )
+        if (
+            result is not None
+            and result.processed_candle_sets
+            and result.live_candle_sets == 0
+        ):
+            self.telemetry.stale(
+                candle_open_time=last_open,
+                correlation_id=correlation_id,
+            )
+        self.telemetry.flush()
 
     def _status(
         self,

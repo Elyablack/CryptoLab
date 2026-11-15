@@ -418,6 +418,12 @@ class PersistentReplaySession:
             ),
         )
 
+    @property
+    def operational_checkpoint(self) -> ReplaySessionCheckpoint:
+        """Expose the immutable durable boundary for read-only observability."""
+        self._ensure_available()
+        return self._last_checkpoint
+
     def process_candle(
         self,
         candle: Candle,
