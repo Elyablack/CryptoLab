@@ -700,7 +700,11 @@ def test_integrity_rejects_corrupt_manual_control_state(tmp_path: Path) -> None:
         recovered.check_integrity()
 
 
-def test_paper_cli_run_once_uses_stage3_dispatch(monkeypatch, capsys) -> None:
+def test_paper_cli_run_once_uses_stage3_dispatch(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
     class FakeTrader:
         def __init__(self, *args, **kwargs) -> None:
             del args, kwargs
@@ -722,6 +726,7 @@ def test_paper_cli_run_once_uses_stage3_dispatch(monkeypatch, capsys) -> None:
         def close(self) -> None:
             pass
 
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("cryptolab.cli.ContinuousPaperTrader", FakeTrader)
 
     result = main(["paper", "run-once", "--session-id", "cli-paper"])

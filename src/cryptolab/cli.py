@@ -472,6 +472,7 @@ def _print_portfolio_paper_status(status) -> None:
 def _create_paper_telemetry(
     args: argparse.Namespace,
 ) -> tuple[PaperTelemetry, MetricsServer | None, NotificationOutbox]:
+    args.state_database.parent.mkdir(parents=True, exist_ok=True)
     repository = PaperStateRepository(args.state_database)
     repository.init_schema()
     notifier = TelegramNotifier.from_environment()

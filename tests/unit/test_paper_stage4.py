@@ -460,6 +460,7 @@ def test_schema_v2_migration_preserves_legacy_tables(tmp_path: Path) -> None:
 
 
 def test_multi_mode_cli_dispatch_and_single_mode_default(
+    tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
@@ -487,6 +488,7 @@ def test_multi_mode_cli_dispatch_and_single_mode_default(
                 message="no synchronized set",
             )
 
+    monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(
         "cryptolab.cli.MultiSymbolPaperTrader", FakePortfolioTrader
     )
