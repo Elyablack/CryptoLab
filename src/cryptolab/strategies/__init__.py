@@ -23,6 +23,9 @@ from cryptolab.strategies.trend_pullback import (
     TrendPullbackExitPolicy,
     TrendPullbackStrategy,
 )
+from cryptolab.strategies.volatility_compression_breakout import (
+    VolatilityCompressionBreakoutStrategy,
+)
 
 __all__ = [
     "BreakoutStrategy",
@@ -41,5 +44,6 @@ __all__ = [
     "TrendFollowingStrategy",
     "TrendPullbackExitPolicy",
     "TrendPullbackStrategy",
+    "VolatilityCompressionBreakoutStrategy",
 ]
 
