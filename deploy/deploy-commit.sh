@@ -25,7 +25,7 @@ done
 # Refuse schema-changing releases; such upgrades need a separate migration plan.
 old=$(sed -n 's/^CRYPTOLAB_IMAGE=//p' .env)
 for image in "$old" "cryptolab-paper:$sha"; do
- docker run --rm --network none --entrypoint python "$image" -c 'import hashlib; from cryptolab.storage.paper_state_repository import SCHEMA_SQL; from cryptolab.storage.sqlite_repository import CREATE_CANDLES_TABLE_SQL; print(hashlib.sha256((SCHEMA_SQL+CREATE_CANDLES_TABLE_SQL).encode()).hexdigest())' </dev/null
+ docker run --rm --network none --entrypoint python "$image" -c 'import cryptolab.cli; import hashlib; from cryptolab.storage.paper_state_repository import SCHEMA_SQL; from cryptolab.storage.sqlite_repository import CREATE_CANDLES_TABLE_SQL; print(hashlib.sha256((SCHEMA_SQL+CREATE_CANDLES_TABLE_SQL).encode()).hexdigest())' </dev/null
 done > "$record/schema-hashes"
 [[ $(sort -u "$record/schema-hashes" | wc -l) -eq 1 ]] || { echo 'Schema differs; manual migration required'; exit 1; }
 image=$(docker image inspect "cryptolab-paper:$sha" --format '{{.Id}}')
