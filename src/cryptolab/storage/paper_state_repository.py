@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -454,7 +455,9 @@ class PaperStateRepository:
 
     def load_session(self, session_id: str) -> StoredReplaySession:
         self._validate_session_id(session_id)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
+            # All SELECTs must observe one committed snapshot while a writer runs.
+            connection.execute("BEGIN")
             session = connection.execute(
                 """
                 SELECT configuration_json, initial_risk_state_json,
@@ -862,7 +865,9 @@ class PaperStateRepository:
     ) -> StoredPortfolioPaperSession:
         """Load the latest portfolio checkpoint and immutable candle journal."""
         self._validate_session_id(session_id)
-        with self._connect() as connection:
+        with closing(self._connect()) as connection, connection:
+            # All SELECTs must observe one committed snapshot while a writer runs.
+            connection.execute("BEGIN")
             session = connection.execute(
                 """
                 SELECT configuration_json, schema_version, serialization_version

@@ -476,3 +476,44 @@ def test_outbox_storage_failure_cannot_break_paper_telemetry(caplog) -> None:
     }
     assert "notification_enqueue_failed" in event_types
     assert "notification_flush_failed" in event_types
+
+
+def test_portfolio_load_keeps_snapshot_during_concurrent_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = repository(tmp_path)
+    create_empty_portfolio_session(repo)
+    database = tmp_path / "paper.db"
+    with sqlite3.connect(database) as writer:
+        writer.execute("PRAGMA journal_mode=WAL")
+    original_connect = PaperStateRepository._connect
+    committed = False
+
+    def connect(self):
+        connection = original_connect(self)
+
+        def between_reads(statement):
+            nonlocal committed
+            if "FROM paper_portfolio_checkpoints" in statement and not committed:
+                committed = True
+                with sqlite3.connect(database) as writer:
+                    writer.execute(
+                        "UPDATE paper_portfolio_sessions SET configuration_json = ?",
+                        ('{"kind":"new"}',),
+                    )
+                    writer.execute(
+                        "UPDATE paper_portfolio_checkpoints SET checkpoint_json = ?",
+                        ('{"kind":"new"}',),
+                    )
+
+        connection.set_trace_callback(between_reads)
+        return connection
+
+    monkeypatch.setattr(PaperStateRepository, "_connect", connect)
+    snapshot = repo.load_portfolio_session("ops")
+    assert committed
+    assert json.loads(snapshot.configuration_json) == {"kind": "test"}
+    assert json.loads(snapshot.checkpoint_json) == {"kind": "test"}
+    latest = repo.load_portfolio_session("ops")
+    assert json.loads(latest.configuration_json) == {"kind": "new"}
+    assert json.loads(latest.checkpoint_json) == {"kind": "new"}
