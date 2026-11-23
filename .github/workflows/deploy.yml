@@ -1,0 +1,49 @@
+name: Deploy paper
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Full 40-character commit SHA on main, with green CI and Security
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: paper-production-deploy
+  cancel-in-progress: false
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: paper-production
+    steps:
+      - name: Validate commit and checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ inputs.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]
+          status=$(gh api "repos/$REPO/compare/$SHA...main" --jq .status)
+          [[ "$status" == ahead || "$status" == identical ]]
+          for workflow in ci.yml security.yml; do
+            conclusion=$(gh api "repos/$REPO/actions/workflows/$workflow/runs?head_sha=$SHA&event=push&per_page=1" --jq '.workflow_runs[0].conclusion')
+            [[ "$conclusion" == success ]] || { echo "$workflow has not passed for $SHA"; exit 1; }
+          done
+      - name: Deploy exact commit
+        env:
+          SHA: ${{ inputs.sha }}
+          DEPLOY_KEY: ${{ secrets.VDS_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.VDS_KNOWN_HOSTS }}
+          HOST: ${{ vars.VDS_HOST }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          trap 'rm -f ~/.ssh/deploy_key' EXIT
+          printf '%s\n' "$SHA" | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 cryptodeploy@"$HOST"
