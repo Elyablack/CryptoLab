@@ -7,7 +7,7 @@ flock -w 60 9
 cd /srv/cryptolab
 release=/srv/cryptolab/releases/$sha
 mkdir -p "$release"
-curl --fail --location --proto '=https' --tlsv1.2 "https://api.github.com/repos/Elyablack/CryptoLab/tarball/$sha" | tar -xz --strip-components=1 -C "$release"
+tar -xz --strip-components=1 -C "$release"
 docker build --label org.opencontainers.image.revision="$sha" -t "cryptolab-paper:$sha" "$release"
 docker run --rm --network none "cryptolab-paper:$sha" paper --help </dev/null >/dev/null
 stamp=$(date -u +%Y%m%dT%H%M%SZ)

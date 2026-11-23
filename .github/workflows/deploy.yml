@@ -35,6 +35,8 @@ jobs:
           done
       - name: Deploy exact commit
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
           SHA: ${{ inputs.sha }}
           DEPLOY_KEY: ${{ secrets.VDS_DEPLOY_KEY }}
           KNOWN_HOSTS: ${{ secrets.VDS_KNOWN_HOSTS }}
@@ -46,4 +48,5 @@ jobs:
           printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/deploy_key
           printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           trap 'rm -f ~/.ssh/deploy_key' EXIT
-          printf '%s\n' "$SHA" | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 cryptodeploy@"$HOST"
+          gh api "repos/$REPO/tarball/$SHA" > "$RUNNER_TEMP/source.tar.gz"
+          { printf '%s\n' "$SHA"; cat "$RUNNER_TEMP/source.tar.gz"; } | ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=15 -o ConnectionAttempts=3 cryptodeploy@"$HOST"
