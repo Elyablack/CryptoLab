@@ -1,9 +1,10 @@
 import sqlite3
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from pathlib import Path
-from threading import Event
+from threading import Event, Thread
 from typing import ClassVar
 
 import httpx
@@ -33,6 +34,7 @@ from cryptolab.paper.models import (
 )
 from cryptolab.paper.risk import PaperRiskManager
 from cryptolab.paper.service import ContinuousPaperTrader
+from cryptolab.replay.persistence_models import ReplayStateIntegrityError
 from cryptolab.replay.models import PriceObservation
 from cryptolab.replay.risk import ReplayRiskContext
 from cryptolab.storage.paper_state_repository import PaperStateRepository
@@ -234,6 +236,81 @@ def test_continuous_loop_honors_graceful_stop(tmp_path: Path) -> None:
     assert PaperStateRepository(
         tmp_path / "state.db"
     ).load_session("paper-test").checkpoint_sequence == 2
+
+
+def test_production_poll_wait_is_interrupted_immediately(
+    tmp_path: Path,
+) -> None:
+    clock = Clock(3 * HOUR)
+    source = FakeMarketSource(clock, [candle(1), candle(2)])
+    trader = ContinuousPaperTrader(
+        PaperBotConfig(
+            session_id="paper-test",
+            market_database=tmp_path / "market.db",
+            state_database=tmp_path / "state.db",
+            warmup_candles=2,
+            poll_seconds=60,
+        ),
+        ScriptedStrategy((Signal.HOLD, Signal.BUY, Signal.SELL)),
+        market_source=source,
+        now_ms=clock,
+    )
+    stop = Event()
+    thread = Thread(target=trader.run_forever, args=(stop,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 2
+    repository = PaperStateRepository(tmp_path / "state.db")
+    while time.monotonic() < deadline:
+        if (
+            repository.session_exists("paper-test")
+            and repository.load_session(
+                "paper-test"
+            ).checkpoint_sequence == 2
+        ):
+            break
+        time.sleep(0.01)
+    else:
+        pytest.fail("paper loop did not reach its interruptible wait")
+
+    started = time.monotonic()
+    stop.set()
+    thread.join(timeout=1)
+
+    assert thread.is_alive() is False
+    assert time.monotonic() - started < 1
+
+
+def test_session_candle_limit_stops_before_unbounded_checkpoint_growth(
+    tmp_path: Path,
+) -> None:
+    clock = Clock(3 * HOUR)
+    source = FakeMarketSource(
+        clock,
+        [candle(1), candle(2), candle(3), candle(4)],
+    )
+    trader = ContinuousPaperTrader(
+        PaperBotConfig(
+            session_id="bounded-paper",
+            market_database=tmp_path / "market.db",
+            state_database=tmp_path / "state.db",
+            warmup_candles=2,
+            poll_seconds=1,
+            maximum_session_candles=3,
+        ),
+        ScriptedStrategy((Signal.HOLD,)),
+        market_source=source,
+        now_ms=clock,
+        sleep=lambda seconds: None,
+    )
+
+    trader.run_once()
+    clock.now = 4 * HOUR
+    trader.run_once()
+    clock.now = 5 * HOUR
+
+    with pytest.raises(ReplayStateIntegrityError, match="candle limit"):
+        trader.run_once()
+    assert trader.status().checkpoint_sequence == 3
 
 
 def test_continuous_loop_recovers_after_temporary_network_failure(

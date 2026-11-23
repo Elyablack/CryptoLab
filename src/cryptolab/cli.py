@@ -164,6 +164,10 @@ def _run_paper(args: argparse.Namespace) -> int:
                 args.state_database,
                 session_id=args.session_id,
                 mode=args.mode,
+                interval=args.interval,
+                maximum_progress_lag_seconds=(
+                    args.maximum_progress_lag_seconds
+                ),
             )
             print(
                 "Paper health: "
@@ -172,7 +176,9 @@ def _run_paper(args: argparse.Namespace) -> int:
                 f"schema={report.schema_version}, "
                 f"checkpoint={report.checkpoint_sequence}, "
                 f"last_candle={report.last_candle_open_time}, "
-                f"reconciled={str(report.reconciled).lower()}"
+                f"reconciled={str(report.reconciled).lower()}, "
+                f"progress_current={str(report.progress_current).lower()}, "
+                f"progress_lag_seconds={report.progress_lag_seconds}"
             )
             print(report.message)
             return 0 if report.healthy else 1
@@ -234,6 +240,7 @@ def _run_paper(args: argparse.Namespace) -> int:
                 interval=args.interval,
                 warmup_candles=args.warmup_candles,
                 poll_seconds=args.poll_seconds,
+                maximum_session_candles=args.maximum_session_candles,
             ),
             strategies[0],
             backtest_config=BacktestConfig(
@@ -333,6 +340,7 @@ def _run_multi_symbol_paper(
             interval=args.interval,
             warmup_candles=args.portfolio_warmup_candles,
             poll_seconds=args.poll_seconds,
+            maximum_session_candles=args.maximum_session_candles,
         ),
         backtest_config=BacktestConfig(
             initial_cash=Decimal("1000"),
@@ -1537,6 +1545,13 @@ def _create_parser() -> argparse.ArgumentParser:
         default=Path("data/paper_state.db"),
         metavar="PATH",
     )
+    health_parser.add_argument("--interval", default="1h")
+    health_parser.add_argument(
+        "--maximum-progress-lag-seconds",
+        type=_parse_nonnegative_integer,
+        default=10_800,
+        help="maximum lag behind the latest closed candle (default: 3 hours)",
+    )
     _add_operational_logging_arguments(health_parser)
 
     backup_parser = paper_subparsers.add_parser(
@@ -1625,6 +1640,15 @@ def _add_paper_runtime_arguments(
         "--poll-seconds",
         type=_parse_positive_integer,
         default=60,
+    )
+    command_parser.add_argument(
+        "--maximum-session-candles",
+        type=_parse_positive_integer,
+        default=10_000,
+        help=(
+            "fail closed before a durable session exceeds this bounded "
+            "journal length (default: 10000)"
+        ),
     )
     command_parser.add_argument(
         "--fee-rate",

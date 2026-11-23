@@ -907,8 +907,13 @@ class PaperStateRepository:
             raise ReplayStateIntegrityError(
                 "Portfolio candle journal does not match checkpoint"
             )
-        for sequence in range(1, int(checkpoint[1]) + 1):
-            pair = [item for item in candles if item[0] == sequence]
+        for offset in range(0, len(candles), 2):
+            sequence = offset // 2 + 1
+            pair = candles[offset : offset + 2]
+            if tuple(item[0] for item in pair) != (sequence, sequence):
+                raise ReplayStateIntegrityError(
+                    "Portfolio candle journal sequence is not consecutive"
+                )
             if [item[1] for item in pair] != ["BTCUSDT", "ETHUSDT"]:
                 raise ReplayStateIntegrityError(
                     "Portfolio candle journal is not synchronized"

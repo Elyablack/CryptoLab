@@ -64,7 +64,7 @@ class ContinuousPaperTrader:
             execution=self.execution_config,
         )
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
-        self._sleep = sleep or time.sleep
+        self._sleep = sleep
         self.telemetry = telemetry
         config.market_database.parent.mkdir(parents=True, exist_ok=True)
         config.state_database.parent.mkdir(parents=True, exist_ok=True)
@@ -156,6 +156,12 @@ class ContinuousPaperTrader:
             )
         else:
             range_start = state.checkpoint_open_time + interval_ms
+        requested = max(0, (closed_range_end - range_start) // interval_ms)
+        if state.checkpoint_sequence + requested > self.config.maximum_session_candles:
+            raise ReplayStateIntegrityError(
+                "Paper session candle limit would be exceeded; create a new "
+                "session after archiving and verifying the current database"
+            )
         if range_start >= closed_range_end:
             result = PaperCycleResult(
                 session_id=self.config.session_id,
@@ -207,9 +213,11 @@ class ContinuousPaperTrader:
                         "Observed public price predates candle receipt"
                     )
                 if self.execution_config.simulated_latency_ms:
-                    self._sleep(
-                        self.execution_config.simulated_latency_ms / 1000
-                    )
+                    delay = self.execution_config.simulated_latency_ms / 1000
+                    if self._sleep is None:
+                        time.sleep(delay)
+                    else:
+                        self._sleep(delay)
                     observation = PriceObservation(
                         price=observation.price,
                         observed_at=max(
@@ -296,13 +304,22 @@ class ContinuousPaperTrader:
                     # from the last durable checkpoint on the next cycle.
                     self.close()
                 if not stop.is_set():
-                    self._sleep(self.config.poll_seconds)
+                    self._wait_for_next_cycle(stop)
         finally:
             if self.telemetry is not None and self._session is not None:
                 self.telemetry.stopped(
                     self._session.current_state.checkpoint_sequence
                 )
             self.close()
+
+    def _wait_for_next_cycle(self, stop: Event) -> None:
+        """Wait for polling while allowing SIGTERM to wake the process."""
+        if self._sleep is None:
+            stop.wait(self.config.poll_seconds)
+        else:
+            # Kept for deterministic unit clocks. Production always follows
+            # the interruptible Event.wait path above.
+            self._sleep(self.config.poll_seconds)
 
     def status(self) -> PaperSessionStatus:
         session = self.start(create_if_missing=False)

@@ -131,7 +131,8 @@ Telegram notifications, health checks, and safe SQLite backup/restore:
 
 ```bash
 cryptolab paper run ... --json-logs --metrics-port 9108
-cryptolab paper health --mode multi --session-id btc-eth-rotation
+cryptolab paper health --mode multi --session-id btc-eth-rotation \
+  --interval 1h --maximum-progress-lag-seconds 10800
 cryptolab paper backup --source-database data/paper_state.db \
   --output backups/paper_state.db
 cryptolab paper verify-backup --backup backups/paper_state.db
@@ -143,6 +144,12 @@ Telegram uses `CRYPTOLAB_TELEGRAM_BOT_TOKEN` and
 `CRYPTOLAB_TELEGRAM_CHAT_ID`; no credential is stored in project files or
 SQLite. See [Stage 5 architecture](docs/paper-bot-stage-5.md) and the
 [operations runbook](docs/paper-bot-operations.md).
+
+The supplied Compose file runs the fixed BTC/ETH Relative Momentum Rotation
+configuration as a public-data-only operational paper simulation. Its research
+status is `NO_CANDIDATE`; it is not a validated profitable strategy. VCB v1 is
+not connected to the paper deployment. The process fails closed at 10,000
+durable candle sets so checkpoint/recovery work cannot grow without bound.
 
 ## Reliable collection behavior
 

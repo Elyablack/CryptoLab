@@ -1,0 +1,31 @@
+groups:
+  - name: cryptolab-paper
+    rules:
+      - alert: CryptoLabPaperTargetDown
+        expr: up{job="cryptolab-paper"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: CryptoLab paper metrics target is unavailable
+      - alert: CryptoLabPaperProcessStopped
+        expr: cryptolab_paper_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: CryptoLab paper process is not operational
+      - alert: CryptoLabPaperDataStale
+        expr: cryptolab_paper_data_lag_seconds > 10800
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: CryptoLab paper data progress is over three hours stale
+      - alert: CryptoLabPaperReconciliationFailure
+        expr: cryptolab_paper_reconciliation_failures_total > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: CryptoLab paper portfolio reconciliation failed

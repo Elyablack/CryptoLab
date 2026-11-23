@@ -82,7 +82,9 @@ as labels, avoiding high cardinality.
 | `cryptolab_paper_paused` | gauge | `1` when manual BUY pause is active. |
 
 `/metrics` is read-only. `/healthz` reports only that the exporter thread is
-responding; the CLI `paper health` performs the durable database check.
+responding. The CLI `paper health` performs the durable database check and,
+when `--maximum-progress-lag-seconds` is supplied, rejects stale, missing, or
+future checkpoint progress.
 
 ## Telegram delivery
 
@@ -120,13 +122,17 @@ pending rotation, controls, and reconciliation history remain unchanged.
 
 ## Deployment files
 
-- `Dockerfile`: Python 3.13 wheel build and non-root UID/GID `10001` runtime.
+- `Dockerfile`: digest-pinned Python 3.13 base, constrained offline wheelhouse,
+  and non-root UID/GID `10001` runtime.
 - `compose.yaml`: one paper process, one SQLite writer, graceful SIGTERM,
   restart policy, healthcheck, resource limits, read-only root filesystem,
   persistent bind mounts, bounded Docker logs, and loopback-only metrics.
 - `.env.example`: names only; never commit real values.
 - `deploy/prometheus-paper.yml`: optional scrape job for an existing internal
   Prometheus deployment.
+- `deploy/prometheus-paper-alerts.yml`: optional target, process, stale-data,
+  and reconciliation alert rules. They are inactive until loaded by an
+  independent Prometheus/Alertmanager installation.
 
 No second systemd service is provided. Docker Compose is the single documented
 process supervisor.
@@ -137,9 +143,14 @@ process supervisor.
 - Telegram is operational notification, not an execution confirmation source.
 - Metrics are stored in memory; only values derivable from durable state are
   reconstructed after restart.
-- The health command is structural and network-free. `paper integrity` remains
-  the deeper deterministic recovery/reconciliation check.
+- The health command is network-free and checks structural state plus optional
+  bounded progress lag. `paper integrity` remains the deeper deterministic
+  recovery/reconciliation check.
 - One process and one SQLite writer remain required.
+- Durable sessions stop before 10,000 candles; the operator must archive and
+  rotate the session rather than allowing unbounded full-prefix work.
+- Docker health alone is not external alerting. Telegram is optional and is
+  disabled in the initial deployment.
 - VPS behavior cannot be claimed from local container verification alone.
 
 See [the operations runbook](paper-bot-operations.md) for deployment, backup,

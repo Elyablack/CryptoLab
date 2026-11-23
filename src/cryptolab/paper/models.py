@@ -113,6 +113,7 @@ class PaperBotConfig:
     market_type: str = "spot"
     warmup_candles: int = 100
     poll_seconds: int = 60
+    maximum_session_candles: int = 10_000
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -128,6 +129,13 @@ class PaperBotConfig:
             raise ValueError("warmup_candles must be positive")
         if type(self.poll_seconds) is not int or self.poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
+        if (
+            type(self.maximum_session_candles) is not int
+            or self.maximum_session_candles <= self.warmup_candles
+        ):
+            raise ValueError(
+                "maximum_session_candles must exceed warmup_candles"
+            )
 
 
 @dataclass(frozen=True)
@@ -206,6 +214,7 @@ class MultiSymbolPaperBotConfig:
     market_type: str = "spot"
     warmup_candles: int = 721
     poll_seconds: int = 60
+    maximum_session_candles: int = 10_000
 
     def __post_init__(self) -> None:
         if not isinstance(self.session_id, str) or not self.session_id.strip():
@@ -223,6 +232,13 @@ class MultiSymbolPaperBotConfig:
             raise ValueError("warmup_candles must be positive")
         if type(self.poll_seconds) is not int or self.poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
+        if (
+            type(self.maximum_session_candles) is not int
+            or self.maximum_session_candles <= self.warmup_candles
+        ):
+            raise ValueError(
+                "maximum_session_candles must exceed warmup_candles"
+            )
 
 
 @dataclass(frozen=True)

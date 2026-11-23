@@ -16,3 +16,4 @@ typing_extensions==4.16.0
 build==1.6.1
 pip-audit==2.10.1
 ruff==0.17.4
+setuptools==84.2.1

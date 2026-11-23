@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: cryptolab-paper:1.0.0
+    image: ${CRYPTOLAB_IMAGE:-cryptolab-paper:1.0.0}
     init: true
     restart: unless-stopped
     stop_signal: SIGTERM
@@ -29,6 +29,8 @@ services:
       - 0.0.0.0
       - --metrics-port
       - "9108"
+      - --maximum-session-candles
+      - "10000"
     environment:
       CRYPTOLAB_TELEGRAM_BOT_TOKEN: ${CRYPTOLAB_TELEGRAM_BOT_TOKEN:-}
       CRYPTOLAB_TELEGRAM_CHAT_ID: ${CRYPTOLAB_TELEGRAM_CHAT_ID:-}
@@ -54,6 +56,10 @@ services:
         - btc-eth-rotation
         - --state-database
         - /app/data/paper_state.db
+        - --interval
+        - 1h
+        - --maximum-progress-lag-seconds
+        - "10800"
       interval: 60s
       timeout: 10s
       retries: 3

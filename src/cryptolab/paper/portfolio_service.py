@@ -108,7 +108,7 @@ class MultiSymbolPaperTrader:
             execution=self.execution_config,
         )
         self._now_ms = now_ms or (lambda: int(time.time() * 1000))
-        self._sleep = sleep or time.sleep
+        self._sleep = sleep
         self._after_sell_checkpoint = after_sell_checkpoint
         self.telemetry = telemetry
         config.market_database.parent.mkdir(parents=True, exist_ok=True)
@@ -226,6 +226,13 @@ class MultiSymbolPaperTrader:
             if self._sequence == 0
             else self._last_open_time() + interval_ms
         )
+        requested = max(0, (closed_range_end - range_start) // interval_ms)
+        if self._sequence + requested > self.config.maximum_session_candles:
+            raise ReplayStateIntegrityError(
+                "Portfolio paper session candle limit would be exceeded; "
+                "create a new session after archiving and verifying the "
+                "current database"
+            )
         fills_before = len(self._adapter.fills)
         if range_start >= closed_range_end:
             live = self._resume_pending(checked_at)
@@ -341,10 +348,17 @@ class MultiSymbolPaperTrader:
                     self._reset_runtime_state()
                     self._started = False
                 if not stop.is_set():
-                    self._sleep(self.config.poll_seconds)
+                    self._wait_for_next_cycle(stop)
         finally:
             if self.telemetry is not None:
                 self.telemetry.stopped(self._sequence)
+
+    def _wait_for_next_cycle(self, stop: Event) -> None:
+        """Wait for polling while allowing SIGTERM to wake the process."""
+        if self._sleep is None:
+            stop.wait(self.config.poll_seconds)
+        else:
+            self._sleep(self.config.poll_seconds)
 
     def status(self) -> MultiSymbolPaperSessionStatus:
         self.start(create_if_missing=False)

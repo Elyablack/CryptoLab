@@ -11,6 +11,17 @@ sudo chown -R 10001:10001 data backups
 chmod 750 data backups
 ```
 
+The reviewed single-process deployment requires at least 2 GiB RAM. Stop
+before deployment if this gate is not met; swap is not a substitute for the
+required runtime and SQLite page-cache headroom.
+
+```bash
+test "$(awk '/MemTotal/ {print $2}' /proc/meminfo)" -ge 2097152
+df -h /
+docker version
+docker compose version
+```
+
 Place the validated `market_data.db` in `data/`. Never put exchange private
 keys in this project; they are not used.
 
@@ -48,15 +59,22 @@ docker compose ps
 docker compose logs --tail=100 paper-bot
 ```
 
-The Compose configuration starts exactly one multi-symbol Rotation paper
-process. Metrics are available only through host loopback:
+The Compose configuration starts exactly one multi-symbol BTC/ETH Relative
+Momentum Rotation paper process. That strategy has research status
+`NO_CANDIDATE`; running it here is an operational paper-simulation exercise,
+not evidence of a profitable or approved trading strategy. VCB v1 is not
+enabled. Metrics are available only through host loopback:
 
 ```bash
 curl --fail http://127.0.0.1:9108/metrics
 ```
 
 To integrate the existing monitoring stack, merge the job from
-`deploy/prometheus-paper.yml`. Do not expose port 9108 publicly.
+`deploy/prometheus-paper.yml` and load
+`deploy/prometheus-paper-alerts.yml`. Do not expose port 9108 publicly. Merely
+shipping these files or observing Docker health is not external monitoring;
+an independently running Prometheus/Alertmanager and an operator route must be
+configured and tested before alerts can be claimed operational.
 
 ## 4. Graceful operation
 
@@ -91,11 +109,15 @@ Fast network-free health check:
 ```bash
 cryptolab paper health \
   --mode multi --session-id btc-eth-rotation \
-  --state-database data/paper_state.db
+  --state-database data/paper_state.db \
+  --interval 1h --maximum-progress-lag-seconds 10800
 ```
 
 This checks SQLite integrity, schema compatibility, session existence, and the
-durable reconciliation flag. It does not reconstruct the strategy.
+durable reconciliation flag. With the lag argument it also fails when the
+checkpoint is missing, ahead of time, or more than three hours behind the
+latest closed hourly candle. It does not reconstruct the strategy and Docker
+does not automatically restart an already-running unhealthy container.
 
 Deep deterministic recovery check uses the same arguments as the running
 session:
@@ -129,7 +151,9 @@ cryptolab paper backup \
 ```
 
 The command refuses an existing destination, creates a consistent snapshot,
-runs `PRAGMA integrity_check`, and verifies the CryptoLab schema version.
+runs SQLite integrity and foreign-key checks, and verifies the complete
+CryptoLab schema contract: every required table, column, key, index, constraint,
+schema version, and paper serialization version.
 
 Verify later without modifying it:
 
@@ -159,7 +183,8 @@ cryptolab paper restore \
 
 cryptolab paper health \
   --mode multi --session-id btc-eth-rotation \
-  --state-database data/restore-check/paper_state.db
+  --state-database data/restore-check/paper_state.db \
+  --interval 1h --maximum-progress-lag-seconds 10800
 
 cryptolab paper integrity \
   --mode multi --session-id btc-eth-rotation --strategy rotation \
@@ -208,6 +233,24 @@ The process logs `metrics_start_failed` and continues paper execution. Check
 the bind address/port and Docker networking. The exporter has no influence on
 orders or accounting.
 
+### Bounded session rotation
+
+The runtime fails closed before a session exceeds 10,000 synchronized hourly
+candle sets. Archive and verify both databases, then start a new explicitly
+named session; never edit or truncate the journal. Local measurements on the
+supported Python runtime gave the following isolated costs:
+
+| Candle sets | Build features for BTC+ETH | Validate/load journal | DB size |
+|---:|---:|---:|---:|
+| 1,000 | 0.030 s | 0.002 s | 0.8 MiB |
+| 10,000 | 0.303 s | 0.027 s | 6.5 MiB |
+| 25,000 | 0.809 s | 0.053 s | 16.0 MiB |
+
+These are development-machine component measurements, not an end-to-end VPS
+recovery SLA. The 10,000 limit bounds the known full-prefix work while leaving
+about 386 days after the initial 721-hour warm-up. Re-measure an actual restore
+on the target after any host or image change.
+
 ## 9. Local verification
 
 ```bash
@@ -217,6 +260,8 @@ orders or accounting.
 git diff --check
 docker build -t cryptolab-paper:stage5 .
 docker compose config
+docker run --rm cryptolab-paper:stage5 --help
+docker run --rm cryptolab-paper:stage5 paper --help
 ```
 
 Local success verifies build/configuration only. It does not prove behavior on

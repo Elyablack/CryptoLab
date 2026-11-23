@@ -326,9 +326,13 @@ for one local writer; concurrent collectors are unsupported. Human-readable
 stdout is stable for research use, while diagnostics use standard `logging` on
 stderr. `--verbose` enables tracebacks at command boundaries.
 
-There is intentionally no Docker or service deployment requirement for v1.0.
-GitHub Actions verifies Python 3.12/3.13, tests, package installation, CLI,
-static checks, dependency audit, and secret scanning.
+The optional paper runtime has one Docker Compose service with one SQLite
+writer, persistent data/backup mounts, a read-only non-root container,
+loopback-only metrics, bounded logs/resources, SIGTERM shutdown, strict
+checkpoint-progress health, and a 10,000-candle fail-closed session limit.
+The image uses a digest-pinned Python base and constrained wheelhouse. GitHub
+Actions verifies Python 3.12/3.13, tests, package installation, CLI, static
+checks, dependency audit, and secret scanning.
 
 ## Security boundaries
 

@@ -300,6 +300,75 @@ def test_health_fails_for_unreconciled_portfolio(tmp_path: Path) -> None:
     assert report.reconciled is False
 
 
+def test_health_requires_recent_progress_when_lag_limit_is_enabled(
+    tmp_path: Path,
+) -> None:
+    repo = repository(tmp_path)
+    create_empty_portfolio_session(repo)
+    with sqlite3.connect(tmp_path / "paper.db") as connection:
+        connection.execute(
+            "UPDATE paper_portfolio_checkpoints "
+            "SET candle_sequence = 1, last_open_time = ? "
+            "WHERE session_id = 'ops'",
+            (9 * 3_600_000,),
+        )
+
+    fresh = paper_health(
+        tmp_path / "paper.db",
+        session_id="ops",
+        mode="multi",
+        maximum_progress_lag_seconds=0,
+        now_ms=10 * 3_600_000,
+    )
+    stale = paper_health(
+        tmp_path / "paper.db",
+        session_id="ops",
+        mode="multi",
+        maximum_progress_lag_seconds=3_600,
+        now_ms=12 * 3_600_000,
+    )
+
+    assert fresh.healthy is True
+    assert fresh.progress_current is True
+    assert fresh.progress_lag_seconds == 0
+    assert stale.healthy is False
+    assert stale.progress_current is False
+    assert stale.progress_lag_seconds == 7_200
+
+
+def test_backup_verification_rejects_incomplete_schema(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    create_empty_portfolio_session(repo)
+    with sqlite3.connect(tmp_path / "paper.db") as connection:
+        connection.execute("DROP TABLE paper_fills")
+
+    with pytest.raises(ValueError, match="missing tables: paper_fills"):
+        verify_sqlite_database(tmp_path / "paper.db")
+
+
+def test_market_backup_verification_rejects_wrong_primary_key(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "market.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """CREATE TABLE candles (
+                exchange TEXT NOT NULL, market_type TEXT NOT NULL,
+                symbol TEXT NOT NULL, interval TEXT NOT NULL,
+                open_time INTEGER NOT NULL, open TEXT NOT NULL,
+                high TEXT NOT NULL, low TEXT NOT NULL, close TEXT NOT NULL,
+                volume TEXT NOT NULL, close_time INTEGER NOT NULL,
+                quote_volume TEXT NOT NULL, number_of_trades INTEGER,
+                taker_buy_base_volume TEXT, taker_buy_quote_volume TEXT,
+                PRIMARY KEY (symbol, interval, open_time)
+            )"""
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+    with pytest.raises(ValueError, match="table structure differs: candles"):
+        verify_sqlite_database(database)
+
+
 def test_backup_cli_round_trip(tmp_path: Path, capsys) -> None:
     repo = repository(tmp_path)
     create_empty_portfolio_session(repo)
@@ -334,7 +403,7 @@ def test_backup_cli_round_trip(tmp_path: Path, capsys) -> None:
         "ops",
         "--state-database",
         str(restored),
-    ]) == 0
+    ]) == 1
     assert "Backup verified" in capsys.readouterr().out
 
 
